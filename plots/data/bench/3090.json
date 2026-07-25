@@ -1,0 +1,17 @@
+{
+  "gpu": "RTX 3090",
+  "device_name": "NVIDIA GeForce RTX 3090",
+  "price_per_hr": 0.22,
+  "vcpu": 112,
+  "workers": 16,
+  "batch": 128,
+  "params_m": 7.78,
+  "gpu_only_it_s": 23.32,
+  "end2end_it_s": 8.372,
+  "gpu_only_gamesides_s": 2984.9,
+  "end2end_gamesides_s": 1071.6,
+  "dataloader_bound_pct": 64.1,
+  "usd_per_m_gamesides_e2e": 0.057,
+  "usd_per_m_gamesides_gpu": 0.0205,
+  "torch": "2.9.1+cu129"
+}

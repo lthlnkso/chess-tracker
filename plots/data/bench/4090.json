@@ -1,0 +1,17 @@
+{
+  "gpu": "RTX 4090",
+  "device_name": "NVIDIA GeForce RTX 4090",
+  "price_per_hr": 0.69,
+  "vcpu": 96,
+  "workers": 16,
+  "batch": 128,
+  "params_m": 7.78,
+  "gpu_only_it_s": 15.175,
+  "end2end_it_s": 5.621,
+  "gpu_only_gamesides_s": 1942.5,
+  "end2end_gamesides_s": 719.5,
+  "dataloader_bound_pct": 63.0,
+  "usd_per_m_gamesides_e2e": 0.2664,
+  "usd_per_m_gamesides_gpu": 0.0987,
+  "torch": "2.9.1+cu129"
+}

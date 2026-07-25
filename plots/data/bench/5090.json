@@ -1,0 +1,17 @@
+{
+  "gpu": "RTX 5090",
+  "device_name": "NVIDIA GeForce RTX 5090",
+  "price_per_hr": 0.99,
+  "vcpu": 256,
+  "workers": 16,
+  "batch": 128,
+  "params_m": 7.78,
+  "gpu_only_it_s": 63.755,
+  "end2end_it_s": 14.514,
+  "gpu_only_gamesides_s": 8160.7,
+  "end2end_gamesides_s": 1857.7,
+  "dataloader_bound_pct": 77.2,
+  "usd_per_m_gamesides_e2e": 0.148,
+  "usd_per_m_gamesides_gpu": 0.0337,
+  "torch": "2.9.1+cu129"
+}

@@ -1,0 +1,56 @@
+{
+  "ckpt": "/workspace/ckpt/id/last.pt",
+  "step": 424226,
+  "n_gallery_players": 20000,
+  "n_test_gamesides": 3632538,
+  "centroid_frac": 0.8,
+  "matched_pool_min": 10,
+  "chance_recall@1": 5e-05,
+  "results": {
+    "1": {
+      "recall@1": 0.10963239435386676,
+      "recall@10": 0.28213011086241563,
+      "recall@100": 0.562872617654526,
+      "median_rank": 62.0,
+      "mean_percentile": 96.84013366699219,
+      "n_queries": 685354,
+      "n_query_players": 12987
+    },
+    "10": {
+      "recall@1": 0.8829598829598829,
+      "recall@10": 0.9763609763609764,
+      "recall@100": 0.9972279972279973,
+      "median_rank": 0.0,
+      "mean_percentile": 99.99227142333984,
+      "n_queries": 12987,
+      "n_query_players": 12987
+    },
+    "half": {
+      "recall@1": 0.8742588742588743,
+      "recall@10": 0.96003696003696,
+      "recall@100": 0.98998998998999,
+      "median_rank": 0.0,
+      "mean_percentile": 99.9723129272461,
+      "n_queries": 12987,
+      "n_query_players": 12987
+    },
+    "all": {
+      "recall@1": 0.9587279587279587,
+      "recall@10": 0.9931469931469932,
+      "recall@100": 0.9987679987679988,
+      "median_rank": 0.0,
+      "mean_percentile": 99.99772644042969,
+      "n_queries": 12987,
+      "n_query_players": 12987
+    },
+    "1_all_players": {
+      "recall@1": 0.10649324549401358,
+      "recall@10": 0.27582390657390865,
+      "recall@100": 0.5544489991438144,
+      "median_rank": 66.0,
+      "mean_percentile": 96.74858093261719,
+      "n_queries": 726478,
+      "n_query_players": 20000
+    }
+  }
+}

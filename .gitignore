@@ -1,0 +1,16 @@
+# secrets — RUNPOD_API_KEY lives here, never commit
+.env
+*.key
+.rp_key
+
+# environments
+.venv/
+__pycache__/
+*.pyc
+
+# model weights — distributed via GitHub Releases (see scripts/fetch_checkpoints.sh)
+ckpt/*.pt
+
+# scratch
+*.log
+.DS_Store

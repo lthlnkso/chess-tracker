@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Play the chess_tracker model</title>
+<style>
+  :root{
+    --bg:#fcfcfb; --ink:#0b0b0b; --muted:#52514e; --line:#e3e2df;
+    --light:#f0d9b5; --dark:#b58863; --sel:#f0d264; --hint:#2a78d6; --last:#cfe2c4;
+    --panel:#ffffff;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{ --bg:#1a1a19; --ink:#fff; --muted:#c3c2b7; --line:#333331;
+           --light:#c9ad8b; --dark:#8a6f52; --sel:#8a7326; --hint:#3987e5;
+           --last:#3c5238; --panel:#232322; }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+  .wrap{max-width:1000px;margin:0 auto;padding:28px 20px 60px}
+  h1{font-size:22px;margin:0 0 4px}
+  .sub{color:var(--muted);font-size:13.5px;margin-bottom:22px}
+  .cols{display:flex;gap:26px;flex-wrap:wrap;align-items:flex-start}
+  .boardwrap{flex:0 0 auto}
+  #board{display:grid;grid-template-columns:repeat(8,58px);
+         grid-template-rows:repeat(8,58px);border:1px solid var(--line);
+         border-radius:6px;overflow:hidden;user-select:none}
+  .sq{display:flex;align-items:center;justify-content:center;font-size:40px;
+      line-height:1;cursor:pointer;position:relative}
+  .sq.l{background:var(--light)} .sq.d{background:var(--dark)}
+  .sq.sel{box-shadow:inset 0 0 0 4px var(--sel)}
+  .sq.lastmv{background:var(--last)}
+  .sq .dot{position:absolute;width:16px;height:16px;border-radius:50%;
+           background:var(--hint);opacity:.55}
+  .sq .ring{position:absolute;inset:4px;border:4px solid var(--hint);
+            border-radius:50%;opacity:.55}
+  .piece{width:52px;height:52px;display:block;pointer-events:none;
+         filter:drop-shadow(0 1px 1.5px rgba(0,0,0,.30))}
+  .panel{flex:1 1 300px;min-width:280px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;
+        padding:14px 16px;margin-bottom:14px}
+  .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+  button{font:inherit;padding:7px 13px;border:1px solid var(--line);border-radius:6px;
+         background:var(--panel);color:var(--ink);cursor:pointer}
+  button:hover{border-color:var(--muted)}
+  button:disabled{opacity:.45;cursor:default}
+  label{color:var(--muted);font-size:13px}
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  td{padding:4px 0}
+  td.san{font-weight:600;width:70px}
+  td.bar{width:100%}
+  .barbg{background:var(--line);border-radius:3px;height:9px;width:100%}
+  .barfg{background:var(--hint);border-radius:3px;height:9px}
+  td.pct{text-align:right;width:52px;color:var(--muted);font-variant-numeric:tabular-nums}
+  .status{font-weight:600;margin-bottom:6px}
+  .muted{color:var(--muted);font-size:13px}
+  .warn{font-size:12.5px;color:var(--muted);line-height:1.45;margin-top:14px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Play the chess_tracker model</h1>
+  <div class="sub" id="sub">loading…</div>
+
+  <div class="cols">
+    <div class="boardwrap">
+      <div id="board"></div>
+      <div class="row" style="margin-top:12px">
+        <button id="new">New game</button>
+        <button id="flip">Play the other colour</button>
+        <button id="undo">Undo</button>
+        <button id="hint">What would it play?</button>
+      </div>
+      <div class="row">
+        <label>Randomness</label>
+        <input id="temp" type="range" min="0" max="150" value="0" step="5" style="flex:1">
+        <span class="muted" id="tempv" style="width:74px">greedy</span>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="card">
+        <div class="status" id="status">—</div>
+        <div class="muted" id="meta"></div>
+      </div>
+      <div class="card">
+        <div class="muted" style="margin-bottom:8px" id="toplabel">
+          What the model thinks comes next
+        </div>
+        <table id="top"><tbody></tbody></table>
+      </div>
+      <div class="warn" id="warn"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+// cburnett SVGs (lichess default) — see play/pieces/NOTICE.md
+let S=null, human="w", sel=null, busy=false;
+
+const $=id=>document.getElementById(id);
+const files="abcdefgh";
+const sqName=(r,f)=>files[f]+(8-r);
+
+function parseFen(fen){
+  const rows=fen.split(" ")[0].split("/"), g=[];
+  for(const row of rows){ const r=[];
+    for(const ch of row){ if(/\d/.test(ch)){ for(let i=0;i<+ch;i++) r.push(null); } else r.push(ch); }
+    g.push(r); }
+  return g;
+}
+
+function render(){
+  const b=$("board"); b.innerHTML="";
+  const g=parseFen(S.fen);
+  const flip = human==="b";
+  const lastFrom = S.last? S.last.slice(0,2):null, lastTo = S.last? S.last.slice(2,4):null;
+  const legalFromSel = sel ? S.legal.filter(u=>u.startsWith(sel)).map(u=>u.slice(2,4)) : [];
+  for(let i=0;i<8;i++) for(let j=0;j<8;j++){
+    const r = flip? 7-i : i, f = flip? 7-j : j;
+    const name=sqName(r,f), piece=g[r][f];
+    const d=document.createElement("div");
+    d.className="sq "+(((r+f)%2===0)?"l":"d");
+    if(name===lastFrom||name===lastTo) d.classList.add("lastmv");
+    if(sel===name) d.classList.add("sel");
+    if(piece){ const im=document.createElement("img");
+      const white = piece===piece.toUpperCase();
+      im.className="piece"; im.draggable=false;
+      im.src=`/pieces/${white?"w":"b"}${piece.toUpperCase()}.svg`;
+      im.alt=(white?"white ":"black ")+piece.toLowerCase();
+      d.appendChild(im); }
+    if(legalFromSel.includes(name)){
+      const m=document.createElement("div");
+      m.className = piece? "ring":"dot"; d.appendChild(m);
+    }
+    d.onclick=()=>click(name);
+    b.appendChild(d);
+  }
+  const t = S.turn==="w"?"White":"Black";
+  $("status").textContent = S.over
+      ? `Game over — ${S.reason} (${S.result})`
+      : (S.turn===human ? `Your move (${t})` : `Model thinking… (${t})`)
+        + (S.check?" — check":"");
+  $("meta").textContent = `ply ${S.ply}   ·   you are ${human==="w"?"White":"Black"}`;
+  $("toplabel").textContent = (S.top && S.top.length)
+      ? (S.last ? "How it chose its reply" : "What it would play in this position")
+      : "What the model thinks comes next";
+  const tb=$("top").querySelector("tbody"); tb.innerHTML="";
+  for(const c of (S.top||[])){
+    const tr=document.createElement("tr");
+    tr.innerHTML=`<td class="san">${c.san}</td>`+
+      `<td class="bar"><div class="barbg"><div class="barfg" style="width:${Math.max(2,c.p*100)}%"></div></div></td>`+
+      `<td class="pct">${(c.p*100).toFixed(1)}%</td>`;
+    tb.appendChild(tr);
+  }
+}
+
+async function post(path, body){
+  busy=true;
+  try{
+    const r=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},
+                             body:JSON.stringify(body)});
+    if(!r.ok){ const e=await r.json().catch(()=>({error:r.statusText}));
+               throw new Error(e.error||"request failed"); }
+    return await r.json();
+  } finally { busy=false; }
+}
+
+function click(name){
+  if(busy||S.over||S.turn!==human) return;
+  if(sel===name){ sel=null; return render(); }
+  const from=S.legal.filter(u=>u.startsWith(name));
+  if(from.length){ sel=name; return render(); }
+  if(sel){
+    const uci=sel+name;
+    const match=S.legal.find(u=>u===uci||u===uci+"q");
+    if(match){ sel=null; play(match); return; }
+  }
+  sel=null; render();
+}
+
+async function play(uci){
+  const temp=+$("temp").value/100;
+  S.turn = S.turn==="w"?"b":"w"; render();
+  try{ S = await post("/api/move",{history:S.history,uci,temperature:temp}); }
+  catch(e){ $("status").textContent="Error: "+e.message; return; }
+  render();
+}
+
+async function newGame(){
+  S = await (await fetch("/api/new")).json(); sel=null;
+  $("sub").textContent = `successor-prediction model · checkpoint step `+
+      `${S.info.step.toLocaleString()} · held-out next-state accuracy `+
+      `${(S.info.val*100).toFixed(1)}%`;
+  $("warn").innerHTML = "It was trained to imitate 1+0 bullet games from lichess, "+
+    "not to play well — so it opens like a book and then blunders like a human in "+
+    "time trouble. It has no search and no evaluation function: it only ranks the "+
+    "positions that could come next.";
+  render();
+  if(human==="b") await play(null);
+}
+
+$("new").onclick=()=>newGame();
+$("flip").onclick=()=>{ human = human==="w"?"b":"w"; newGame(); };
+$("undo").onclick=async()=>{
+  if(!S.history.length) return;
+  const h=S.history.slice(0, Math.max(0, S.history.length-2));
+  S = await post("/api/hint",{history:h}); S.history=h; S.last=null; sel=null; render();
+};
+$("hint").onclick=async()=>{
+  S = await post("/api/hint",{history:S.history}); S.last=null; render();
+};
+$("temp").oninput=e=>{
+  const v=+e.target.value/100;
+  $("tempv").textContent = v===0? "greedy" : "T = "+v.toFixed(2);
+};
+newGame();
+</script>
+</body>
+</html>

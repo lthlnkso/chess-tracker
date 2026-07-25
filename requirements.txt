@@ -1,0 +1,6 @@
+# Inference + the browser demo run fine on CPU-only torch.
+torch>=2.4
+numpy>=1.26
+python-chess>=1.11
+zstandard>=0.22
+matplotlib>=3.8      # figures only
