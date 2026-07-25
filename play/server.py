@@ -14,6 +14,7 @@ would silently produce a weaker opponent and nothing would ever flag it.
 from __future__ import annotations
 
 import argparse
+import http.cookies
 import json
 import os
 import sys
@@ -24,6 +25,8 @@ import torch
 import chess
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import metrics                                     # noqa: E402
 from model import SuccessorScorer, Config          # noqa: E402
 from bitboards import board_to_planes8, N_PLANES13  # noqa: E402
 
@@ -124,22 +127,73 @@ def state(history_moves: list[str], ranked=None, last=None) -> dict:
     }
 
 
+VISITOR_COOKIE = "cp_vid"
+
+
+def human_is_white(n_plies: int, human_moving: bool) -> bool:
+    """Which colour the human has, from whose turn it is.
+
+    Ply parity gives the side to move. If the human is the one moving now they
+    own that side; if the model is moving, the human owns the other one — which
+    is how "let the model open" games end up recorded as the human playing
+    black rather than silently mislabelled.
+    """
+    white_to_move = n_plies % 2 == 0
+    return white_to_move if human_moving else not white_to_move
+
+
+def outcome_for_human(result: str, human_white: bool) -> str:
+    """Map a PGN result to win/loss/draw *from the human's point of view*.
+
+    Recording one side consistently matters: an inverted row is invisible in
+    aggregate and would quietly turn a losing model into a winning one.
+    """
+    if result == "1-0":
+        return "win" if human_white else "loss"
+    if result == "0-1":
+        return "loss" if human_white else "win"
+    return "draw"
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def _send(self, code, body, ctype="application/json"):
+    def visitor_id(self):
+        """Read the visitor cookie, or mint one for this response."""
+        raw = self.headers.get("Cookie", "")
+        if raw:
+            jar = http.cookies.SimpleCookie()
+            try:
+                jar.load(raw)
+            except http.cookies.CookieError:
+                jar = {}
+            if VISITOR_COOKIE in jar:
+                return jar[VISITOR_COOKIE].value, False
+        return metrics.new_visitor_id(), True
+
+    def _send(self, code, body, ctype="application/json", set_cookie=None):
         data = body if isinstance(body, bytes) else json.dumps(body).encode()
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
+        if set_cookie:
+            self.send_header(
+                "Set-Cookie",
+                f"{VISITOR_COOKIE}={set_cookie}; Max-Age=63072000; Path=/; "
+                "HttpOnly; SameSite=Lax",
+            )
         self.end_headers()
         self.wfile.write(data)
 
     def do_GET(self):
         if self.path in ("/", "/index.html"):
+            vid, is_new = self.visitor_id()
             with open(os.path.join(HERE, "index.html"), "rb") as f:
-                return self._send(200, f.read(), "text/html; charset=utf-8")
+                return self._send(
+                    200, f.read(), "text/html; charset=utf-8",
+                    set_cookie=vid if is_new else None,
+                )
         if self.path.startswith("/pieces/"):
             name = os.path.basename(self.path)
             if not name.endswith(".svg") or "/" in name.replace(os.sep, "/")[:-4]:
@@ -153,6 +207,22 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, state([]))
         self._send(404, {"error": "not found"})
 
+    def _send_state(self, payload, vid, human_white):
+        """Send a game state, recording the outcome if it is a terminal one.
+
+        Every path out of /api/move funnels through here, so a game can't end
+        via a branch that forgot to record it.
+        """
+        if payload.get("over"):
+            metrics.record("chess.game_ended", {
+                "visitor_id": vid,
+                "result": outcome_for_human(payload.get("result", "*"), human_white),
+                "reason": payload.get("reason") or "unknown",
+                "plies": payload.get("ply"),
+                "human_colour": "white" if human_white else "black",
+            })
+        return self._send(200, payload)
+
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0))
         req = json.loads(self.rfile.read(n) or b"{}")
@@ -161,6 +231,17 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path == "/api/move":
             uci = req.get("uci")
+            vid, _ = self.visitor_id()
+            human_white = human_is_white(len(hist), human_moving=bool(uci))
+
+            # An empty history means this request opens a new game. The server
+            # is stateless, so ply count is the only signal there is.
+            if not hist:
+                metrics.record("chess.game_started", {
+                    "visitor_id": vid,
+                    "human_colour": "white" if human_white else "black",
+                })
+
             if uci:
                 board = chess.Board()
                 for u in hist:
@@ -179,13 +260,15 @@ class Handler(BaseHTTPRequestHandler):
             for u in hist:
                 board.push(chess.Move.from_uci(u))
             if board.is_game_over():
-                return self._send(200, state(hist))
+                return self._send_state(state(hist), vid, human_white)
 
             choice, ranked = think(hist, temp)
             if choice is None:
-                return self._send(200, state(hist))
+                return self._send_state(state(hist), vid, human_white)
             hist.append(choice)
-            return self._send(200, state(hist, ranked, last=choice))
+            return self._send_state(
+                state(hist, ranked, last=choice), vid, human_white
+            )
 
         if self.path == "/api/hint":
             _, ranked = think(hist, 0.0)
@@ -201,6 +284,7 @@ def main():
     ap.add_argument("--port", type=int, default=8000)
     args = ap.parse_args()
     load(args.ckpt)
+    metrics.start()
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     print(f"serving on http://localhost:{args.port}", file=sys.stderr)
     srv.serve_forever()
