@@ -1,0 +1,46 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "chess-demo",
+      "runtimeExecutable": ".venv/bin/python",
+      "runtimeArgs": [
+        "play/server.py",
+        "--ckpt",
+        "ckpt/final/ctx5_pre.pt",
+        "--id-ckpt",
+        "ckpt/final/ctx10_ft.pt",
+        "--gallery",
+        "play/gallery_ctx10.npz",
+        "--verifier",
+        "",
+        "--bayes",
+        "",
+        "--port",
+        "8010",
+        "--dev"
+      ],
+      "port": 8010
+    },
+    {
+      "name": "chess-demo-ctx10bot",
+      "runtimeExecutable": ".venv/bin/python",
+      "runtimeArgs": [
+        "play/server.py",
+        "--ckpt",
+        "ckpt/final/ctx10_pre.pt",
+        "--id-ckpt",
+        "ckpt/final/ctx10_ft.pt",
+        "--gallery",
+        "play/gallery_ctx10.npz",
+        "--verifier",
+        "",
+        "--bayes",
+        "",
+        "--port",
+        "8020"
+      ],
+      "port": 8020
+    }
+  ]
+}

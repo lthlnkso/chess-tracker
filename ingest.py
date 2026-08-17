@@ -51,6 +51,10 @@ _COMMENT_RE = re.compile(r"\{[^}]*\}")
 _NAG_RE = re.compile(r"\$\d+")
 _MOVENUM_RE = re.compile(r"\b\d+\.(\.\.)?")
 _RESULT_TOKEN_RE = re.compile(r"(1-0|0-1|1/2-1/2|\*)\s*$")
+# lichess writes "{ [%clk 0:00:59 ] }" after each ply: time REMAINING for the
+# player who just moved. Present on ~99% of modern games, absent before ~2017.
+_CLK_RE = re.compile(r"\[%clk\s+(\d+):(\d+):(\d+(?:\.\d+)?)\]")
+CLK_UNKNOWN = 0xFFFF          # sentinel; real values clamp to 65534 cs (~10.9 min)
 
 
 # --- parsing ---------------------------------------------------------------
@@ -87,6 +91,13 @@ def parse_game(raw: str, min_plies: int, keep_tc: frozenset[str] | None = None):
         return None
 
     text = " ".join(movetext_lines)
+
+    # Pull clocks out in order BEFORE comments are stripped. They are only
+    # trustworthy if there is exactly one per ply -- a partial list cannot be
+    # aligned to moves, so the whole game is marked clockless rather than
+    # silently misaligned.
+    clk_raw = _CLK_RE.findall(text)
+
     text = _COMMENT_RE.sub(" ", text)
     text = _NAG_RE.sub(" ", text)
     text = _RESULT_TOKEN_RE.sub(" ", text)
@@ -102,7 +113,15 @@ def parse_game(raw: str, min_plies: int, keep_tc: frozenset[str] | None = None):
 
     if len(codes) < min_plies:
         return None
-    return headers, codes
+
+    if len(clk_raw) == len(codes):
+        clocks = []
+        for h, m, sec in clk_raw:
+            cs = int((int(h) * 3600 + int(m) * 60 + float(sec)) * 100)
+            clocks.append(min(max(cs, 0), CLK_UNKNOWN - 1))
+    else:
+        clocks = [CLK_UNKNOWN] * len(codes)
+    return headers, codes, clocks
 
 
 def _parse_tc(tc: str) -> tuple[int, int]:
@@ -147,11 +166,12 @@ def parse_batch(raw_games: list[str]):
         parsed = parse_game(raw, _MIN_PLIES, _KEEP_TC)
         if parsed is None:
             continue
-        h, codes = parsed
+        h, codes, clocks = parsed
         out.append((
             h.get("White", "?"),
             h.get("Black", "?"),
             np.asarray(codes, dtype=np.uint16).tobytes(),
+            np.asarray(clocks, dtype=np.uint16).tobytes(),
             len(codes),
             _parse_elo(h.get("WhiteElo")),
             _parse_elo(h.get("BlackElo")),
@@ -227,11 +247,13 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
     moves_path = os.path.join(args.out, "moves.u16")
+    clocks_path = os.path.join(args.out, "clocks.u16")
 
     players: dict[str, int] = {}
     metas: list[tuple] = []
     offset = 0
     seen = 0
+    n_clocked = 0
     truncated = False
     t0 = time.time()
 
@@ -242,14 +264,18 @@ def main():
     pool = Pool(args.workers, initializer=_init_worker,
                 initargs=(args.min_plies, keep_tc))
     try:
-        with open(moves_path, "wb", buffering=1 << 22) as mf:
+        with open(moves_path, "wb", buffering=1 << 22) as mf, \
+                open(clocks_path, "wb", buffering=1 << 22) as cf:
             batches = batched(iter_games(stream), args.batch)
             for results in pool.imap(parse_batch, batches, chunksize=1):
                 seen += args.batch
-                for (w, b, blob, nply, welo, belo, res, term, tcb, tci, date) in results:
+                for (w, b, blob, cblob, nply, welo, belo, res, term,
+                     tcb, tci, date) in results:
                     wp = players.setdefault(w, len(players))
                     bp = players.setdefault(b, len(players))
                     mf.write(blob)
+                    cf.write(cblob)
+                    n_clocked += cblob[:2] != b"\xff\xff"
                     metas.append((offset, nply, wp, bp, welo, belo, res, term, tcb, tci, date))
                     offset += nply
                 dt = time.time() - t0
@@ -300,6 +326,8 @@ def main():
             "min_plies": args.min_plies,
             "time_controls": keep_tc,
             "moves_dtype": "uint16",
+            "clocks_dtype": "uint16",
+            "games_with_clocks": int(n_clocked),
             "meta_dtype": [(n, META_DTYPE[n].str) for n in META_DTYPE.names],
             "terminations": TERMINATIONS,
             "elapsed_sec": round(time.time() - t0, 1),

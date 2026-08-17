@@ -1,5 +1,16 @@
 # Reproducing the results
 
+> **STALE for the identification half.** Section 3e below drives `finetune_id.py`
+> against `data/combined`, which is the PRE-multigame pipeline. That combined
+> index points at `data/2026-*` shards, and **those have no `clocks.u16`** --
+> `MultiGameDataset` hard-fails without it, and zeroing the time features
+> collapsed top-10 from 25/25 to 4/25. It also uses `--loss supcon`, which the
+> loss sweep later beat by +52% with `ms`.
+>
+> The current pipeline is `train_multigame.py` -> `finetune_ctx.py` over
+> `data/mt/2026-*`; see [`TRAINING.md`](TRAINING.md). The tier-1 and tier-2 data
+> and pre-training sections here are still accurate.
+
 Three tiers, by how much they cost you.
 
 | tier | needs | time | cost | reproduces |

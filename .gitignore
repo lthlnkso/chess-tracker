@@ -1,4 +1,4 @@
-# secrets — RUNPOD_API_KEY lives here, never commit
+# secrets — RUNPOD_API_KEY and the S3 keys live here, never commit
 .env
 *.key
 .rp_key
@@ -8,9 +8,29 @@
 __pycache__/
 *.pyc
 
-# model weights — distributed via GitHub Releases (see scripts/fetch_checkpoints.sh)
-ckpt/*.pt
+# Model weights and galleries. These are hundreds of MB and several exceed
+# GitHub's 100 MB hard limit; they are distributed via the S3 bucket instead
+# (see docs/prod_deployed.md for the keys and their sha256s).
+ckpt/**/*.pt
+*.npz
+
+# Ingested shards and derived numeric artifacts — 40 GB, rebuildable from S3.
+data/
+plots/data/
+*.u16
+*.npy
 
 # scratch
 *.log
+*.bak
 .DS_Store
+
+# Visitor-reported feedback. Real usernames tied to gameplay, so it stays local
+# and out of a public repo; play/saved/*.json is kept deliberately as the
+# regression suite (see docs/prod_deployed.md "Golden test").
+play/claims.jsonl
+play/giveups.jsonl
+play/saved/giveup_*.json
+
+# unrelated file that happens to live in this directory
+N.Y.C. Groceries Operator(s) RFP.pdf

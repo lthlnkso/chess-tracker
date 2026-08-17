@@ -1,0 +1,69 @@
+{
+  "args": {
+    "shard": "data/2026-06-big",
+    "out": "ckpt/ablation.json",
+    "pre_steps": 700,
+    "ft_steps": 450,
+    "batch": 24,
+    "p": 12,
+    "k": 4,
+    "lr": 0.0006,
+    "ft_lr": 0.0003,
+    "d_model": 128,
+    "layers": 4,
+    "max_len": 120,
+    "plies_per_game": 8,
+    "n_cand": 12,
+    "workers": 5,
+    "w_time": 0.3,
+    "w_elo": 0.3,
+    "eval_players": 1200,
+    "min_games": 8,
+    "test_frac": 0.25,
+    "seed": 0
+  },
+  "arms": {
+    "A_board": {
+      "gallery": 1200,
+      "queries": 9139,
+      "recall@1": 0.02319728583097458,
+      "recall@10": 0.12320822477340698,
+      "median_rank": 131.0,
+      "chance@1": 0.0008333333333333334,
+      "pretrain": {
+        "move_acc": 0.3645833432674408,
+        "elo_mae": 421.76220703125,
+        "time_acc": 0.03454437106847763
+      },
+      "minutes": 4.96
+    },
+    "B_time_input": {
+      "gallery": 1200,
+      "queries": 9139,
+      "recall@1": 0.022103074938058853,
+      "recall@10": 0.12222343683242798,
+      "median_rank": 130.0,
+      "chance@1": 0.0008333333333333334,
+      "pretrain": {
+        "move_acc": 0.3229166567325592,
+        "elo_mae": 420.2685546875,
+        "time_acc": 0.019058963283896446
+      },
+      "minutes": 4.99
+    },
+    "C_time_plus_aux": {
+      "gallery": 1200,
+      "queries": 9139,
+      "recall@1": 0.029106028378009796,
+      "recall@10": 0.13294671475887299,
+      "median_rank": 117.0,
+      "chance@1": 0.0008333333333333334,
+      "pretrain": {
+        "move_acc": 0.4479166567325592,
+        "elo_mae": 351.1995544433594,
+        "time_acc": 0.47111377120018005
+      },
+      "minutes": 5.06
+    }
+  }
+}

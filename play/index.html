@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Play the chess_tracker model</title>
+<title>Who are you?</title>
 <style>
   :root{
     --bg:#fcfcfb; --ink:#0b0b0b; --muted:#52514e; --line:#e3e2df;
@@ -25,83 +25,433 @@
   .boardwrap{flex:0 0 auto}
   #board{display:grid;grid-template-columns:repeat(8,58px);
          grid-template-rows:repeat(8,58px);border:1px solid var(--line);
-         border-radius:6px;overflow:hidden;user-select:none}
+         border-radius:6px;overflow:hidden;user-select:none;touch-action:none}
   .sq{display:flex;align-items:center;justify-content:center;font-size:40px;
       line-height:1;cursor:pointer;position:relative}
   .sq.l{background:var(--light)} .sq.d{background:var(--dark)}
   .sq.sel{box-shadow:inset 0 0 0 4px var(--sel)}
-  .sq.lastmv{background:var(--last)}
+  .sq.pre{box-shadow:inset 0 0 0 4px #4a8fd6}
+  .sq.pre::after{content:"";position:absolute;inset:0;pointer-events:none;
+      background:rgba(74,143,214,.20)}
+  /* Translucent overlay rather than replacing the square's colour, so the board
+     pattern still reads underneath and it layers correctly with the check glow. */
+  .sq.lastmv::after{content:"";position:absolute;inset:0;pointer-events:none;
+      background:rgba(155,199,0,.24)}
+  .sq.grabbable{cursor:grab}
+  .sq.dragging img{opacity:.25}
+  /* Check is drawn as an overlay, not a background swap, so the square keeps its
+     own colour and the last-move tint underneath -- same layering lichess uses. */
+  .sq .checkglow{position:absolute;inset:0;pointer-events:none;
+      background:radial-gradient(ellipse at center,
+        rgba(255,0,0,.95) 0%, rgba(231,0,0,.75) 26%,
+        rgba(169,0,0,.25) 62%, rgba(169,0,0,0) 90%)}
   .sq .dot{position:absolute;width:16px;height:16px;border-radius:50%;
            background:var(--hint);opacity:.55}
   .sq .ring{position:absolute;inset:4px;border:4px solid var(--hint);
             border-radius:50%;opacity:.55}
   .piece{width:52px;height:52px;display:block;pointer-events:none;
          filter:drop-shadow(0 1px 1.5px rgba(0,0,0,.30))}
+  #ghost{position:fixed;z-index:50;pointer-events:none;width:52px;height:52px;
+         filter:drop-shadow(0 3px 6px rgba(0,0,0,.45))}
   .panel{flex:1 1 300px;min-width:280px}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;
         padding:14px 16px;margin-bottom:14px}
   .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
-  button{font:inherit;padding:7px 13px;border:1px solid var(--line);border-radius:6px;
+  button{font:inherit;padding:9px 18px;border:1px solid var(--line);border-radius:6px;
          background:var(--panel);color:var(--ink);cursor:pointer}
   button:hover{border-color:var(--muted)}
-  button:disabled{opacity:.45;cursor:default}
-  label{color:var(--muted);font-size:13px}
   table{width:100%;border-collapse:collapse;font-size:14px}
   td{padding:4px 0}
-  td.san{font-weight:600;width:70px}
   td.bar{width:100%}
   .barbg{background:var(--line);border-radius:3px;height:9px;width:100%}
   .barfg{background:var(--hint);border-radius:3px;height:9px}
-  td.pct{text-align:right;width:52px;color:var(--muted);font-variant-numeric:tabular-nums}
-  .status{font-weight:600;margin-bottom:6px}
+  .err{border-color:#e2504a;color:#e2504a}
+  .err.hidden{display:none}
   .muted{color:var(--muted);font-size:13px}
   .warn{font-size:12.5px;color:var(--muted);line-height:1.45;margin-top:14px}
+  .conf{margin-top:14px;border-top:1px solid var(--line);padding-top:12px}
+  .games{font-size:15px}
+  .games b{font-size:26px;font-variant-numeric:tabular-nums;transition:color .3s}
+  .games .of{color:var(--muted)}
+  .games b.g0{color:var(--muted)}
+  .games b.g1{color:#e0a32e}
+  .games b.g2{color:#5aa860}
+  td.who{padding-right:8px}
+  td.pc{text-align:right;width:64px;font-variant-numeric:tabular-nums;
+        color:var(--muted)}
+  tr.lead td.pc{color:var(--ink);font-weight:600}
+  .modal{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;
+         align-items:center;justify-content:center;z-index:100}
+  .modal.hidden{display:none}
+  /* Claim / give-up controls. The claim button sits inside the candidate row so
+     the thing being claimed is unambiguous -- a separate control listing names
+     again would let somebody claim a row they are not looking at. */
+  td.act{width:76px;text-align:right;padding-left:8px}
+  button.mine{font-size:11.5px;padding:2px 8px;line-height:1.5;opacity:.55;
+              white-space:nowrap}
+  tr:hover button.mine{opacity:1}
+  button.mine.on{opacity:1;border-color:var(--good,#5b8f5b);color:var(--good,#5b8f5b)}
+  tr.claimed td{background:rgba(110,160,110,.13)}
+  tr.claimed td.who{font-weight:600}
+  /* This sheet has no generic .hidden -- it is scoped to .modal.hidden and
+     .err.hidden. Both new controls need their own, and #devbar needs ID
+     specificity to beat its own display:flex. */
+  #giveup{margin-top:10px;font-size:12px;opacity:.7}
+  #giveup:hover{opacity:1}
+  #giveup.hidden,#devbar.hidden{display:none}
+  .mrow{display:flex;gap:8px;margin-top:12px}
+  .mrow button{flex:1}
+  #devbar{margin-top:10px;padding-top:10px;border-top:1px dashed var(--line);
+          display:flex;gap:8px;align-items:center}
+  #devbar .tag{font-size:11px;letter-spacing:.08em;text-transform:uppercase;
+               color:var(--muted)}
+  #devmsg{font-size:11.5px;color:var(--muted)}
+  .modalbox{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+            padding:26px 30px;max-width:380px;text-align:center;
+            box-shadow:0 12px 40px rgba(0,0,0,.35)}
+  .mtitle{font-size:24px;font-weight:700;margin-bottom:4px}
+  .mreason{margin-bottom:14px}
+  .mid{margin:10px 0 18px;font-size:13.5px;color:var(--muted);line-height:1.5}
+  .melo{margin:16px 0 4px;padding:12px 14px;border:1px solid var(--line);
+        border-radius:8px;font-size:15px}
+  .melo .num{font-size:26px;font-weight:700;font-variant-numeric:tabular-nums}
+  .melo .rng{color:var(--muted);font-size:12.5px;margin-top:2px}
+  .melo.empty{display:none}
+  /* Optional: the visitor can name themselves and see exactly where they sit,
+     which is far more informative than "not in the top 10" -- that covers
+     everything from rank 11 to rank 550,000. */
+  .ptag{font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;
+        color:var(--muted);margin-bottom:8px}
+  button.small{padding:5px 11px;font-size:13px}
+  button.danger{border-color:#e2504a;color:#e2504a}
+  #sound{position:absolute;top:26px;right:20px;padding:5px 11px;font-size:13px}
+  .wrap{position:relative}
+  .probe input{font:inherit;padding:6px 9px;border:1px solid var(--line);
+               border-radius:6px;background:var(--bg);color:var(--ink)}
+  .prank{font-variant-numeric:tabular-nums}
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>Play the chess_tracker model</h1>
+  <h1>Who are you?</h1>
+  <button id="sound" title="sound on/off">🔊</button>
   <div class="sub" id="sub">loading…</div>
 
   <div class="cols">
     <div class="boardwrap">
       <div id="board"></div>
-      <div class="row" style="margin-top:12px">
-        <button id="new">New game</button>
-        <button id="flip">Play the other colour</button>
-        <button id="undo">Undo</button>
-        <button id="hint">What would it play?</button>
-      </div>
-      <div class="row">
-        <label>Randomness</label>
-        <input id="temp" type="range" min="0" max="150" value="0" step="5" style="flex:1">
-        <span class="muted" id="tempv" style="width:74px">greedy</span>
-      </div>
     </div>
 
     <div class="panel">
+      <div class="card err hidden" id="errcard"><div id="status"></div></div>
       <div class="card">
-        <div class="status" id="status">—</div>
-        <div class="muted" id="meta"></div>
-      </div>
-      <div class="card">
-        <div class="muted" style="margin-bottom:8px" id="toplabel">
-          What the model thinks comes next
+        <div class="row" style="justify-content:space-between;align-items:center;margin:0 0 8px">
+          <div class="muted">opponent</div>
+          <div id="botclock" style="font-variant-numeric:tabular-nums;font-size:17px;color:var(--muted)">1:00.0</div>
         </div>
-        <table id="top"><tbody></tbody></table>
+        <div class="row" style="justify-content:space-between;align-items:center;margin:0">
+          <div class="muted">your clock</div>
+          <div id="clock" style="font-variant-numeric:tabular-nums;font-size:22px">1:00.0</div>
+        </div>
       </div>
-      <div class="warn" id="warn"></div>
+      <div class="card">
+        <div class="muted" style="margin-bottom:8px" id="idlabel">
+          play a game and we'll guess who you are</div>
+        <table id="who"><tbody></tbody></table>
+        <div class="conf">
+          <div class="row" style="justify-content:space-between;align-items:baseline;margin:0">
+            <div class="games"><b id="ngames">0</b><span class="of"> of 10 games</span></div>
+            <button id="clear" class="small">Clear</button>
+          </div>
+          <div class="muted" id="conf2">we usually know you by 5</div>
+          <div class="muted" id="blurb" style="margin-top:8px;font-size:11.5px;line-height:1.45"></div>
+          <button id="giveup" class="small hidden">None of these are me →</button>
+          <div id="devbar" class="hidden">
+            <span class="tag">dev</span>
+            <input id="devname" placeholder="save as…" spellcheck="false"
+                   style="flex:1;min-width:0;font-size:12px;padding:4px 7px">
+            <button id="devsave" class="small">Save games</button>
+            <span id="devmsg"></span>
+          </div>
+        </div>
+      </div>
+      <div class="card probe">
+        <div class="ptag">Optional: enter your lichess username and we'll
+          tell you how close we are to guessing it.</div>
+        <div class="row" style="margin:0 0 8px">
+          <input id="ptarget" placeholder="your lichess username" spellcheck="false"
+                 style="flex:1;min-width:0">
+        </div>
+        <div id="prank" class="muted"></div>
+      </div>
     </div>
+  </div>
+</div>
+
+<div class="modal hidden" id="modal">
+  <div class="modalbox">
+    <div class="mtitle" id="mtitle">Game over</div>
+    <div class="mreason muted" id="mreason"></div>
+    <div class="melo" id="melo"></div>
+    <div class="mid" id="mid"></div>
+    <button id="mnew">New game</button>
+  </div>
+</div>
+
+<div class="modal hidden" id="cmodal">
+  <div class="modalbox">
+    <div class="mtitle" id="cmtitle">Is this your account?</div>
+    <div class="mreason muted" id="cmbody"></div>
+    <div class="mrow">
+      <button id="cmno" class="small">No</button>
+      <button id="cmyes">Yes, that's me</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal hidden" id="gmodal">
+  <div class="modalbox">
+    <div class="mtitle">We didn't find you</div>
+    <div class="mreason muted">Tell us your lichess username and we'll keep your
+      games as a test case, so we do better next time.</div>
+    <input id="gname" placeholder="your lichess username" spellcheck="false"
+           style="width:100%;margin-top:12px">
+    <div class="mrow">
+      <button id="gcancel" class="small">Cancel</button>
+      <button id="gsend">Send</button>
+    </div>
+    <div class="muted" id="gmsg" style="font-size:12px;margin-top:8px"></div>
   </div>
 </div>
 
 <script>
 // cburnett SVGs (lichess default) — see play/pieces/NOTICE.md
-let S=null, human="w", sel=null, busy=false;
+let S=null, human="w", sel=null, busy=false, drag=null, lastDropAt=0;
+// The model reads think time at every ply and leans on it hard -- with clock
+// features zeroed, top-10 identification fell from 25/25 to 4/25. So the demo
+// keeps a real 60+0 bullet clock and reports genuine per-move durations.
+const BASE_MS=60000;
+// Ten, not five. One bundle caps at the model's five game slots, but several
+// bundles can be scored against the same centroid and summed: measured r@1 goes
+// 0.8825 -> 0.9425 going from one bundle to two. Five is where it becomes
+// useful; ten is where it gets good.
+const TARGET_GAMES=10;
+// Measured on the 558,735-player gallery: top-10 recall is 65.7% at five games
+// and 79.0% at ten, so ten is where it usually already works.
+//
+// It is NOT where the curve flattens -- that was an earlier belief and it was
+// wrong. Nobody had measured past ten because ten is the model's slot count,
+// but the server fuses up to three bundles, and recall keeps climbing:
+// 0.790 at 10, 0.842 at 20, 0.867 at 30. So TARGET_GAMES is only what the
+// panel ASKS for; MAX_QUERY_GAMES is what actually gets sent, and a visitor who
+// keeps playing gets the benefit without being nagged for thirty games.
+const MAX_QUERY_GAMES=30;      // = server MAX_BUNDLES * n_game_slots
+const TYPICAL=5;
+let times=[], moveStart=null, myClock=BASE_MS, clockTimer=null, botClock=BASE_MS;
+// The clock does not run until the visitor's first move. Otherwise it burns
+// while they are still reading the page, and a 60-second bullet clock can be
+// half gone before they touch a piece.
+let clockArmed=false;
+// Pre-move: chosen while the opponent is thinking and fired the instant it
+// becomes your turn. Legality cannot be checked here -- the page has no chess
+// engine -- so it is validated against the server's legal list on arrival and
+// silently dropped if the position made it impossible.
+let premove = null;
+// The opponent plays at the visitor's own estimated rating. In a real lichess
+// game the opponent is near your level; a bot averaged over every rating is a
+// distribution no human in the gallery generates, and the identifier reads the
+// opponent's plies as half of each game.
+let botElo = +(localStorage.getItem("cp_botelo") || 0) || null;
+let finished = JSON.parse(localStorage.getItem("cp_games")||"[]");
 
 const $=id=>document.getElementById(id);
+// Sub-1% is common with one game and rounds to "0%", which reads as broken
+// rather than as honest uncertainty.
+const fmtPct = p => !p ? "—" : (p >= 0.10 ? Math.round(p*100)+"%"
+                  : p >= 0.01 ? (p*100).toFixed(1)+"%" : "<1%");
+// Gallery names are third-party strings going into innerHTML. Lichess
+// usernames are tame, but escaping is not conditional on that staying true.
+const esc = t => String(t).replace(/[&<>"']/g,
+  c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const files="abcdefgh";
 const sqName=(r,f)=>files[f]+(8-r);
+
+/* ---- sound ----------------------------------------------------------------
+   Synthesised with Web Audio rather than shipping lichess's own files. The
+   piece SVGs here are cburnett, redistributed under GPLv2+ with a NOTICE, but
+   lichess's sound sets carry mixed and partly non-commercial terms, which is a
+   bad thing to bake into a product. A wooden click is a short noise burst
+   through a bandpass plus a fast-decaying low sine -- close enough in character,
+   and nothing to download or attribute.
+--------------------------------------------------------------------------- */
+let actx=null, soundOn = localStorage.getItem("cp_sound") !== "0";
+
+function audio(){
+  if(!actx){
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if(!AC) return null;
+    actx = new AC();
+  }
+  // Browsers start the context suspended until a user gesture.
+  if(actx.state === "suspended") actx.resume();
+  return actx;
+}
+
+function thock({freq=190, noiseHz=1700, dur=0.075, gain=0.20, q=1.1}={}){
+  const ac=audio(); if(!ac || !soundOn) return;
+  const t=ac.currentTime;
+  // Noise transient: the "knock" of wood on wood.
+  const n=Math.floor(ac.sampleRate*dur);
+  const buf=ac.createBuffer(1,n,ac.sampleRate);
+  const d=buf.getChannelData(0);
+  for(let i=0;i<n;i++) d[i]=(Math.random()*2-1)*Math.pow(1-i/n, 3);
+  const src=ac.createBufferSource(); src.buffer=buf;
+  const bp=ac.createBiquadFilter(); bp.type="bandpass";
+  bp.frequency.value=noiseHz; bp.Q.value=q;
+  const ng=ac.createGain(); ng.gain.value=gain;
+  src.connect(bp).connect(ng).connect(ac.destination);
+  src.start(t);
+  // Body: a low sine that decays fast, giving it weight.
+  const o=ac.createOscillator(); o.type="sine"; o.frequency.value=freq;
+  const og=ac.createGain();
+  og.gain.setValueAtTime(gain*0.9, t);
+  og.gain.exponentialRampToValueAtTime(0.0001, t+dur*1.6);
+  o.connect(og).connect(ac.destination);
+  o.start(t); o.stop(t+dur*1.8);
+}
+
+function tone(freq, dur, gain=0.16, type="triangle", delay=0){
+  const ac=audio(); if(!ac || !soundOn) return;
+  const t=ac.currentTime+delay;
+  const o=ac.createOscillator(); o.type=type; o.frequency.value=freq;
+  const g=ac.createGain();
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(gain, t+0.012);
+  g.gain.exponentialRampToValueAtTime(0.0001, t+dur);
+  o.connect(g).connect(ac.destination);
+  o.start(t); o.stop(t+dur+0.02);
+}
+
+// A soft sandy hiss while the opponent thinks. Filtered noise at low gain, with
+// the filter drifting so it breathes rather than sitting as a flat tone. Without
+// it an instant-looking pause and a five-second one are indistinguishable, and
+// the page reads as stalled.
+let hiss = null;
+function startHiss(){
+  const ac = audio(); if(!ac || !soundOn || hiss) return;
+  const n = ac.sampleRate * 2;
+  const buf = ac.createBuffer(1, n, ac.sampleRate);
+  const d = buf.getChannelData(0);
+  for(let i=0;i<n;i++) d[i] = Math.random()*2-1;
+  const src = ac.createBufferSource(); src.buffer = buf; src.loop = true;
+  const bp = ac.createBiquadFilter(); bp.type="bandpass";
+  bp.frequency.value = 3200; bp.Q.value = 0.7;
+  const g = ac.createGain();
+  g.gain.setValueAtTime(0.0001, ac.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.020, ac.currentTime + 0.25);
+  // Slow wobble on the filter so it sounds like falling sand, not white noise.
+  const lfo = ac.createOscillator(); lfo.type="sine"; lfo.frequency.value = 0.6;
+  const lg = ac.createGain(); lg.gain.value = 700;
+  lfo.connect(lg).connect(bp.frequency);
+  src.connect(bp).connect(g).connect(ac.destination);
+  src.start(); lfo.start();
+  hiss = {src, lfo, g, ac};
+}
+function stopHiss(){
+  if(!hiss) return;
+  const {src, lfo, g, ac} = hiss; hiss = null;
+  try{
+    g.gain.cancelScheduledValues(ac.currentTime);
+    g.gain.setValueAtTime(Math.max(g.gain.value, 0.0001), ac.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + 0.18);
+    src.stop(ac.currentTime + 0.22); lfo.stop(ac.currentTime + 0.22);
+  }catch(e){ /* already stopped */ }
+}
+
+const SFX = {
+  move:    ()=>thock({freq:190, noiseHz:1700, dur:0.070, gain:0.20}),
+  capture: ()=>thock({freq:140, noiseHz:1150, dur:0.105, gain:0.30, q:0.8}),
+  check:   ()=>{ tone(880,0.10,0.13,"square"); tone(1320,0.12,0.11,"square",0.085); },
+  win:     ()=>{ tone(523,0.16); tone(659,0.16,0.16,"triangle",0.13);
+                 tone(784,0.30,0.17,"triangle",0.26); },
+  lose:    ()=>{ tone(392,0.18); tone(311,0.18,0.15,"triangle",0.15);
+                 tone(247,0.36,0.15,"triangle",0.30); },
+  draw:    ()=>{ tone(440,0.20); tone(440,0.26,0.13,"triangle",0.19); },
+  lowtime: ()=>tone(1500,0.055,0.10,"square"),
+};
+
+// Piece count falls exactly when something is taken, which catches en passant
+// too -- checking whether the destination square was occupied does not.
+const pieceCount = fen => (fen.split(" ")[0].match(/[a-zA-Z]/g)||[]).length;
+
+function fmtClock(ms){
+  ms=Math.max(0,ms); const s=ms/1000;
+  return (s>=60? Math.floor(s/60)+":"+String(Math.floor(s%60)).padStart(2,"0") : Math.floor(s)+"")
+         + "." + Math.floor((ms%1000)/100);
+}
+function paintClock(){
+  const el=$("clock");
+  el.textContent = fmtClock(myClock);
+  // Reset the colour here too. Only paintClock2 used to set it, so a clock that
+  // went red in time trouble stayed red into the next game at a full minute.
+  el.style.color = myClock < 10000 ? "#e2504a" : "";
+  $("botclock").textContent = fmtClock(botClock);
+}
+function startClock(){
+  stopClock(); moveStart=performance.now();
+  clockTimer=setInterval(paintClock2, 100);
+}
+let lastTick=null;
+function paintClock2(){
+  const el=$("clock");
+  const live = myClock - (moveStart? (performance.now()-moveStart):0);
+  el.textContent = fmtClock(Math.max(0, live));
+  el.style.color = live < 10000 ? "#e2504a" : "";
+  // Tick once per second under ten, the way a bullet clock does.
+  if(live > 0 && live < 10000){
+    const s = Math.ceil(live/1000);
+    if(s !== lastTick){ lastTick = s; SFX.lowtime(); }
+  } else if(live >= 10000) lastTick = null;
+  if(live <= 0) flagFall();
+}
+function stopClock(){ if(clockTimer){ clearInterval(clockTimer); clockTimer=null; } }
+
+// Run the opponent's clock down while it thinks, so the delay is visibly the
+// opponent using its time rather than the page having stalled.
+function opponentThinks(ms){
+  return new Promise(resolve=>{
+    const start = performance.now(), from = botClock;
+    const el = $("botclock");
+    const iv = setInterval(()=>{
+      const gone = performance.now() - start;
+      el.textContent = fmtClock(Math.max(0, from - gone));
+      if(gone >= ms){ clearInterval(iv); resolve(); }
+    }, 100);
+    setTimeout(()=>{ clearInterval(iv); resolve(); }, ms + 60);
+  });
+}
+// Running out of time ends the game, as it does on lichess. Time forfeit is how
+// most 1+0 bullet games actually end, and the identifier is trained on exactly
+// those clock traces.
+function flagFall(){
+  if(!S || S.over) return;
+  stopClock();
+  myClock = 0; moveStart = null; paintClock();
+  S.over = true;
+  S.reason = "time forfeit";
+  S.result = human==="w" ? "0-1" : "1-0";
+  finish();
+}
+function commitMoveTime(){
+  const dt = moveStart? (performance.now()-moveStart) : 0;
+  myClock = Math.max(0, myClock - dt);
+  moveStart=null; paintClock();
+  // Report to the SECOND, because that is all lichess records in these games:
+  // clocks are stored in centiseconds but the [%clk] tags tick once a second,
+  // so every think time the model trained on is a whole number of seconds.
+  // Sending 1527.8 ms is a value the feature has never taken.
+  return Math.round(dt/1000)*1000;
+}
 
 function parseFen(fen){
   const rows=fen.split(" ")[0].split("/"), g=[];
@@ -110,6 +460,13 @@ function parseFen(fen){
     g.push(r); }
   return g;
 }
+// The server reports THAT the side to move is in check but not where its king
+// is, and the highlight needs the square. The FEN already carries it.
+function kingSquare(g, colour){
+  const want = colour==="w" ? "K" : "k";
+  for(let r=0;r<8;r++) for(let f=0;f<8;f++) if(g[r][f]===want) return sqName(r,f);
+  return null;
+}
 
 function render(){
   const b=$("board"); b.innerHTML="";
@@ -117,13 +474,21 @@ function render(){
   const flip = human==="b";
   const lastFrom = S.last? S.last.slice(0,2):null, lastTo = S.last? S.last.slice(2,4):null;
   const legalFromSel = sel ? S.legal.filter(u=>u.startsWith(sel)).map(u=>u.slice(2,4)) : [];
+  const checkSq = (S.check && !S.over) ? kingSquare(g, S.turn) : null;
+  const canMove = !busy && !S.over && S.turn===human;
   for(let i=0;i<8;i++) for(let j=0;j<8;j++){
     const r = flip? 7-i : i, f = flip? 7-j : j;
     const name=sqName(r,f), piece=g[r][f];
     const d=document.createElement("div");
     d.className="sq "+(((r+f)%2===0)?"l":"d");
+    d.dataset.sq=name;
     if(name===lastFrom||name===lastTo) d.classList.add("lastmv");
     if(sel===name) d.classList.add("sel");
+    if(premove && (name===premove.from || name===premove.to)) d.classList.add("pre");
+    if(canMove && S.legal.some(u=>u.startsWith(name))) d.classList.add("grabbable");
+    if(name===checkSq){
+      const cg=document.createElement("div"); cg.className="checkglow"; d.appendChild(cg);
+    }
     if(piece){ const im=document.createElement("img");
       const white = piece===piece.toUpperCase();
       im.className="piece"; im.draggable=false;
@@ -134,26 +499,12 @@ function render(){
       const m=document.createElement("div");
       m.className = piece? "ring":"dot"; d.appendChild(m);
     }
-    d.onclick=()=>click(name);
+    d.addEventListener("pointerdown", e=>onDown(e, name));
+    d.addEventListener("click", ()=>click(name));
     b.appendChild(d);
   }
-  const t = S.turn==="w"?"White":"Black";
-  $("status").textContent = S.over
-      ? `Game over — ${S.reason} (${S.result})`
-      : (S.turn===human ? `Your move (${t})` : `Model thinking… (${t})`)
-        + (S.check?" — check":"");
-  $("meta").textContent = `ply ${S.ply}   ·   you are ${human==="w"?"White":"Black"}`;
-  $("toplabel").textContent = (S.top && S.top.length)
-      ? (S.last ? "How it chose its reply" : "What it would play in this position")
-      : "What the model thinks comes next";
-  const tb=$("top").querySelector("tbody"); tb.innerHTML="";
-  for(const c of (S.top||[])){
-    const tr=document.createElement("tr");
-    tr.innerHTML=`<td class="san">${c.san}</td>`+
-      `<td class="bar"><div class="barbg"><div class="barfg" style="width:${Math.max(2,c.p*100)}%"></div></div></td>`+
-      `<td class="pct">${(c.p*100).toFixed(1)}%</td>`;
-    tb.appendChild(tr);
-  }
+
+
 }
 
 async function post(path, body){
@@ -167,54 +518,464 @@ async function post(path, body){
   } finally { busy=false; }
 }
 
-function click(name){
-  if(busy||S.over||S.turn!==human) return;
-  if(sel===name){ sel=null; return render(); }
-  const from=S.legal.filter(u=>u.startsWith(name));
-  if(from.length){ sel=name; return render(); }
-  if(sel){
-    const uci=sel+name;
-    const match=S.legal.find(u=>u===uci||u===uci+"q");
-    if(match){ sel=null; play(match); return; }
-  }
-  sel=null; render();
+/* ---- input: click-to-move and drag-and-drop share one commit path ---- */
+
+function tryMove(from, to){
+  const uci=from+to;
+  const match=S.legal.find(u=>u===uci||u===uci+"q");   // auto-queen
+  if(match){ sel=null; play(match); return true; }
+  return false;
 }
 
-async function play(uci){
-  const temp=+$("temp").value/100;
-  S.turn = S.turn==="w"?"b":"w"; render();
-  try{ S = await post("/api/move",{history:S.history,uci,temperature:temp}); }
-  catch(e){ $("status").textContent="Error: "+e.message; return; }
+// True when a square holds one of the visitor's pieces, read from the FEN --
+// the only way to know without a chess engine in the page.
+function mine(name){
+  const g = parseFen(S.fen);
+  const f = files.indexOf(name[0]), r = 8 - (+name[1]);
+  const p = g[r] && g[r][f];
+  if(!p) return false;
+  return (p === p.toUpperCase()) === (human === "w");
+}
+
+function setPremove(from, to){
+  premove = {from, to};
+  sel = null;
   render();
+}
+
+function click(name){
+  if(drag) return;                       // a drag already handled this press
+  // A drag ends with a pointerup that the browser may follow with a click on
+  // whatever is under the cursor; without this the click would immediately
+  // deselect the piece just dropped. A timestamp is used rather than a one-shot
+  // capture listener: when a drag COMMITS a move the board re-renders and no
+  // click ever arrives, so that listener stayed armed and swallowed the next
+  // real click anywhere on the page -- which silently broke the New game button.
+  if(performance.now() - lastDropAt < 250) return;
+  if(S.over) return;
+  if(S.turn !== human){
+    // Opponent's turn: collect a pre-move instead of ignoring the click.
+    if(premove){ premove = null; return render(); }
+    if(sel){ if(mine(sel) && sel !== name) return setPremove(sel, name); sel = null; return render(); }
+    if(mine(name)){ sel = name; return render(); }
+    return;
+  }
+  if(busy) return;
+  if(sel===name){ sel=null; return render(); }
+  if(sel && tryMove(sel, name)) return;
+  sel = S.legal.some(u=>u.startsWith(name)) ? name : null;
+  render();
+}
+
+function onDown(e, name){
+  if(S.over) return;
+  if(e.button!==undefined && e.button!==0) return;
+  const pre = S.turn !== human;
+  if(pre){ if(!mine(name)) return; }
+  else if(busy || !S.legal.some(u=>u.startsWith(name))) return;
+  const sq = e.currentTarget;
+  const img = sq.querySelector("img");
+  if(!img) return;
+  e.preventDefault();
+  sel = name;
+  // Paint selection/target hints before building the ghost, then re-find the
+  // square: render() replaces every node, so a reference taken earlier is stale.
+  render();
+  const live = document.querySelector(`[data-sq="${name}"]`);
+  if(live) live.classList.add("dragging");
+  const ghost = document.createElement("img");
+  ghost.id="ghost"; ghost.src=img.src; ghost.draggable=false;
+  document.body.appendChild(ghost);
+  drag = {from:name, ghost};
+  moveGhost(e);
+  window.addEventListener("pointermove", moveGhost);
+  window.addEventListener("pointerup", onUp, {once:true});
+  window.addEventListener("pointercancel", cancelDrag, {once:true});
+  window.addEventListener("contextmenu", cancelDrag, {once:true});
+  window.addEventListener("blur", cancelDrag, {once:true});
+}
+
+function moveGhost(e){
+  if(!drag) return;
+  drag.ghost.style.left = (e.clientX - 26) + "px";
+  drag.ghost.style.top  = (e.clientY - 26) + "px";
+}
+
+// A right-click (or the browser stealing the pointer) means pointerup never
+// arrives, so the floating piece stayed on screen forever and the square kept
+// its half-faded original. Every abnormal end routes here.
+function cancelDrag(){
+  if(!drag) return;
+  drag.ghost.remove();
+  drag = null;
+  lastDropAt = performance.now();
+  detachDrag();
+  sel = null;
+  render();
+}
+function detachDrag(){
+  window.removeEventListener("pointermove", moveGhost);
+  window.removeEventListener("pointercancel", cancelDrag);
+  window.removeEventListener("contextmenu", cancelDrag);
+  window.removeEventListener("blur", cancelDrag);
+}
+
+function onUp(e){
+  detachDrag();
+  if(!drag) return;
+  const {from, ghost} = drag;
+  ghost.remove();
+  // #ghost is pointer-events:none, so this reads the square underneath.
+  const el = document.elementFromPoint(e.clientX, e.clientY);
+  const target = el && el.closest(".sq");
+  const to = target ? target.dataset.sq : null;
+  drag = null;
+  lastDropAt = performance.now();
+  if(to && to!==from){
+    if(S.turn !== human && !S.over) setPremove(from, to);
+    else if(!tryMove(from, to)) render();  // illegal: keep the piece selected
+  } else {
+    render();                            // dropped where it started: just select
+  }
+}
+
+/* ---- game flow ---- */
+
+async function play(uci){
+  if(uci) clockArmed = true;            // a human move; the clock is live from here
+  const before = pieceCount(S.fen);
+  let heard = before;                   // piece count at the last sound played
+  S.turn = S.turn==="w"?"b":"w"; render();
+  const dt = commitMoveTime();
+  times.push(dt);                       // the human's move
+  try{
+    const res = await post("/api/move",{history:S.history,uci,temperature:0,
+                                        times:times,bot_elo:botElo});
+    // The reply's think time comes from the server, sampled from real 1+0 games.
+    // It used to be a hard 0, which is a value no ply in the training data ever
+    // takes -- and the identifier reads per-ply time as a feature, so half of
+    // every game was telling it something impossible.
+    // Floor the VISUAL gap so an instant reply is still a distinct move you can
+    // hear. The recorded think time stays the sampled value -- this changes what
+    // the eye and ear get, not what the identifier is told.
+    const wait = Math.max(res.bot_ms > 0 ? res.bot_ms : 0, 260);
+    let mid = before;
+    if(res.mid){
+      // Show the human's move landing, then let the opponent actually spend the
+      // time we are about to record for it. Reporting a think time for a reply
+      // that appeared instantly is the same lie in a different place.
+      S = res.mid;
+      mid = pieceCount(S.fen);
+      // The two plies are now separated in time, so each gets its own sound --
+      // one combined click would misrepresent a tempo the player can hear.
+      if(mid < before) SFX.capture(); else SFX.move();
+      if(S.check && !S.over) SFX.check();
+      render();
+      startHiss();
+      await opponentThinks(wait);
+      stopHiss();
+    }
+    S = res;
+    heard = mid;
+    if(S.history.length > times.length) times.push(S.bot_ms ?? 1000);
+    if(typeof S.bot_clock_ms === "number") botClock = S.bot_clock_ms;
+  }
+  catch(e){ showError(e.message); return; }
+  // Sound for whichever ply just appeared: the reply when the two were shown
+  // separately, otherwise the whole exchange.
+  if(pieceCount(S.fen) < heard) SFX.capture(); else SFX.move();
+  if(S.check && !S.over) SFX.check();
+  if(S.over) finish(); else if(clockArmed) startClock();
+  render(); paintClock();
+
+  // Fire a pending pre-move now that it is our turn. Validated against the
+  // server's legal list: the page cannot know whether the opponent's reply made
+  // it impossible, and an illegal one is dropped rather than surfaced as an
+  // error the visitor did not cause.
+  if(premove && !S.over && S.turn === human){
+    const p = premove; premove = null;
+    const match = S.legal.find(u => u === p.from + p.to || u === p.from + p.to + "q");
+    if(match){ await play(match); }
+    else render();
+  }
+}
+
+function finish(){
+  stopClock();
+  recordFinished();
+  render();
+  showModal();
+}
+
+function recordFinished(){
+  if(!S || !S.over || !S.history.length) return;
+  finished.push({history:S.history, times:times.slice(), human_white:human==="w"});
+  finished = finished.slice(-20);
+  localStorage.setItem("cp_games", JSON.stringify(finished));
+  paintConfidence();
+  refreshWho();
+}
+
+// The rating comes back on the identify call, so the modal shows a placeholder
+// until that returns rather than blocking the result screen behind a forward
+// pass. If identification fails the rating block simply stays hidden.
+function paintElo(elo){
+  if(elo && elo.elo){ botElo = elo.elo; localStorage.setItem("cp_botelo", String(elo.elo)); }
+  const el=$("melo");
+  if(!elo || !elo.elo){ el.classList.add("empty"); el.innerHTML=""; return; }
+  el.classList.remove("empty");
+  const lo = elo.elo - elo.sd, hi = elo.elo + elo.sd;
+  el.innerHTML = `<div>we think you're rated</div>`+
+    `<div class="num">${elo.elo}</div>`+
+    `<div class="rng">most likely ${lo}–${hi} · from ${finished.length} game`+
+    `${finished.length===1?"":"s"}</div>`;
+}
+
+function outcome(){
+  if(!S.result || S.result==="1/2-1/2") return {title:"Draw", won:null};
+  const humanWon = (S.result==="1-0") === (human==="w");
+  return {title: humanWon ? "You won" : "You lost", won:humanWon};
+}
+
+function showModal(){
+  const o=outcome();
+  (o.won===null ? SFX.draw : o.won ? SFX.win : SFX.lose)();
+  $("mtitle").textContent=o.title;
+  $("mreason").textContent=`${S.reason} · ${S.result}`;
+  $("melo").classList.add("empty");     // refilled when identify() returns
+  const n=finished.length;
+  $("mid").textContent = n>=TARGET_GAMES
+    ? `${n} games recorded — that's enough for our best guess. Keep playing to sharpen it.`
+    : `${n} game${n===1?"":"s"} recorded. It takes about ${TARGET_GAMES} to identify a player, so ${TARGET_GAMES-n} more to go.`;
+  $("modal").classList.remove("hidden");
+}
+
+// Rank, not just top-10 membership. "Not in the top 10" spans everything from
+// rank 11 to rank 550,000, and those mean completely different things about
+// whether the games carry signal at all.
+function paintProbe(p){
+  const el=$("prank");
+  if(!p){ el.textContent=""; return; }
+  if(p.missing){ el.innerHTML=`<b>${p.name}</b> is not in this gallery`; return; }
+  const pct=p.top_pct;
+  const better=(100-pct).toFixed(2);
+  el.innerHTML=`<b>${p.name}</b> ranks <span class="prank">${p.rank.toLocaleString()}</span>`+
+    ` of ${p.of.toLocaleString()}<br>`+
+    `<span class="muted">top ${pct<0.01?"0.01":pct.toFixed(2)}%</span>`;
+}
+
+function showError(msg){
+  $("status").textContent = msg;
+  $("errcard").classList.remove("hidden");
+  setTimeout(()=>$("errcard").classList.add("hidden"), 6000);
+}
+
+function paintConfidence(){
+  const n = finished.length;
+  const el = $("ngames");
+  el.textContent = n;
+  // Colour carries the progress now that the bar is gone: grey until there is
+  // anything to say, warming as evidence accumulates, settled once past the
+  // point where we usually already know.
+  el.className = n === 0 ? "g0" : n < TYPICAL ? "g1" : "g2";
+  $("conf2").textContent = n === 0 ? "we usually know you by " + TYPICAL
+    : n < TYPICAL ? "we usually know you by " + TYPICAL
+    : n < TARGET_GAMES ? "keep going to sharpen it"
+    : "that's all we need";
+}
+
+async function refreshWho(){
+  const label=$("idlabel"), tb=document.querySelector("#who tbody");
+  if(!finished.length){ label.innerHTML="play a game and we'll guess who you are";
+    tb.innerHTML=""; $("giveup").classList.add("hidden"); return; }
+  label.textContent="guessing from "+finished.length+" game"+(finished.length>1?"s":"")+"…";
+  let r;
+  const target = ($("ptarget").value||"").trim();
+  try{ r = await post("/api/identify",{games:finished.slice(-MAX_QUERY_GAMES), target:target||null}); }
+  catch(e){ label.textContent="identification unavailable"; return; }
+  if(!r.top || !r.top.length){ label.textContent="no gallery loaded"; tb.innerHTML=""; return; }
+  paintElo(r.elo);
+  paintProbe(r.probe);
+  // "if you're in the gallery" is not hedging, it is the actual claim: the
+  // percentage comes from RECALL_BY_GAMES, measured only on players who ARE in
+  // it. For anyone else the true chance is zero, and saying so plainly is the
+  // difference between "out of scope" and "this thing is broken".
+  label.innerHTML = r.in_top10
+    ? `<b>${Math.round(r.in_top10*100)}%</b> chance you're in this list, `
+      + `<span class="muted">if you're one of the ${r.gallery.toLocaleString()} `
+      + `players we track</span>`
+    : `top 10 of ${r.gallery.toLocaleString()} players`;
+  if(r.blurb) $("blurb").textContent = r.blurb;
+  lastTop = r.top.map(p=>p.name); lastRank = r.probe ? r.probe.rank : null;
+  tb.innerHTML = r.top.map((p,i)=>{
+    const mine = claims.has(String(p.name).toLowerCase());
+    return `<tr class="${i===0?"lead":""}${mine?" claimed":""}">`+
+      `<td class="muted" style="width:22px">${i+1}</td>`+
+      `<td class="who">${esc(p.name)}</td><td class="pc">${fmtPct(p.pct)}</td>`+
+      `<td class="act"><button class="small mine${mine?" on":""}" `+
+      `data-name="${esc(p.name)}">${mine?"✓ mine":"it's me"}</button></td></tr>`;
+  }).join("");
+  tb.querySelectorAll("button.mine").forEach(b=>
+    b.onclick = ()=>onClaimClick(b.dataset.name));
+  $("giveup").classList.remove("hidden");
+}
+
+// --- claiming -------------------------------------------------------------
+// A claim is ground truth: the visitor is telling us the answer. Everything
+// else this demo produces is a guess, so these records are worth more than any
+// amount of extra eval on shard data.
+const MAX_CLAIMS = 3;
+let claims = new Set(JSON.parse(localStorage.getItem("cp_claims")||"[]"));
+let lastTop = [], lastRank = null, pendingClaim = null;
+const saveClaims = ()=>localStorage.setItem("cp_claims", JSON.stringify([...claims]));
+
+async function sendClaim(name, claimed){
+  try{
+    const r = await post("/api/claim", {name, claimed, rank:lastRank,
+                                        games:finished.slice(-MAX_QUERY_GAMES)});
+    if(!r.ok && r.error==="limit"){
+      alert(`You can claim up to ${r.max} accounts. Un-claim one first.`);
+      return false;
+    }
+    return true;
+  }catch(e){ return false; }         // a logging failure must not block the UI
+}
+
+async function onClaimClick(name){
+  const key = String(name).toLowerCase();
+  if(claims.has(key)){               // declaiming is a correction: no ceremony
+    claims.delete(key); saveClaims(); refreshWho();
+    sendClaim(key, false);
+    return;
+  }
+  if(claims.size >= MAX_CLAIMS){
+    alert(`You can claim up to ${MAX_CLAIMS} accounts. Un-claim one first.`);
+    return;
+  }
+  pendingClaim = key;
+  $("cmbody").textContent = `Confirm that ${name} is your account.`;
+  $("cmodal").classList.remove("hidden");
+}
+
+$("cmno").onclick = ()=>{ pendingClaim=null; $("cmodal").classList.add("hidden"); };
+$("cmyes").onclick = async ()=>{
+  const key = pendingClaim; pendingClaim=null;
+  $("cmodal").classList.add("hidden");
+  if(!key) return;
+  if(await sendClaim(key, true)){ claims.add(key); saveClaims(); refreshWho(); }
+};
+
+// --- giving up ------------------------------------------------------------
+// A labelled MISS -- the games plus the username we failed to surface. No
+// shard-derived eval can manufacture this case, so the games are saved in the
+// same shape as play/saved/*.json and replay with the existing tooling.
+$("giveup").onclick = ()=>{
+  $("gname").value = ($("ptarget").value||"").trim();
+  $("gmsg").textContent = "";
+  $("gmodal").classList.remove("hidden");
+  $("gname").focus();
+};
+$("gcancel").onclick = ()=>$("gmodal").classList.add("hidden");
+$("gsend").onclick = async ()=>{
+  const username = ($("gname").value||"").trim();
+  if(!username){ $("gmsg").textContent = "Please enter a username."; return; }
+  $("gmsg").textContent = "sending…";
+  try{
+    await post("/api/giveup", {username, games:finished.slice(-MAX_QUERY_GAMES),
+                               rank:lastRank, top:lastTop});
+    $("gmsg").textContent = "Thank you — saved. This helps us improve.";
+    setTimeout(()=>$("gmodal").classList.add("hidden"), 1400);
+  }catch(e){ $("gmsg").textContent = "Could not send, sorry."; }
+};
+
+// --- dev only -------------------------------------------------------------
+// window.DEV is injected by server.py ONLY when it was started with --dev, so
+// this markup never reaches a production browser.
+if(window.DEV){
+  $("devbar").classList.remove("hidden");
+  $("devsave").onclick = async ()=>{
+    if(!finished.length){ $("devmsg").textContent = "no games"; return; }
+    const name = ($("devname").value||"").trim()
+              || ($("ptarget").value||"").trim() || "current";
+    try{
+      const r = await post("/api/save", {games:finished, name});
+      $("devmsg").textContent = `${r.saved} → saved/${r.file}`;
+    }catch(e){ $("devmsg").textContent = "save failed"; }
+  };
 }
 
 async function newGame(){
-  S = await (await fetch("/api/new")).json(); sel=null;
-  $("sub").textContent = `successor-prediction model · checkpoint step `+
-      `${S.info.step.toLocaleString()} · held-out next-state accuracy `+
-      `${(S.info.val*100).toFixed(1)}%`;
-  $("warn").innerHTML = "It was trained to imitate 1+0 bullet games from lichess, "+
-    "not to play well — so it opens like a book and then blunders like a human in "+
-    "time trouble. It has no search and no evaluation function: it only ranks the "+
-    "positions that could come next.";
+  $("modal").classList.add("hidden");
+  times=[]; myClock=BASE_MS; botClock=BASE_MS; clockArmed=false; lastTick=null;
+  premove=null;
+  stopClock(); paintClock();
+  S = await (await fetch("/api/new")).json(); sel=null; times=[]; myClock=BASE_MS; botClock=BASE_MS;
+  $("sub").textContent = `you play 1+0 bullet against a model trained to imitate `+
+      `lichess players · then it guesses which lichess player YOU are`;
   render();
+  // No startClock() here: it begins on the visitor's first move. Their opening
+  // ply is therefore recorded as 0 ms, which is what the data looks like anyway
+  // -- 58% of real opening plies are logged as 0 seconds.
   if(human==="b") await play(null);
 }
 
-$("new").onclick=()=>newGame();
-$("flip").onclick=()=>{ human = human==="w"?"b":"w"; newGame(); };
-$("undo").onclick=async()=>{
-  if(!S.history.length) return;
-  const h=S.history.slice(0, Math.max(0, S.history.length-2));
-  S = await post("/api/hint",{history:h}); S.history=h; S.last=null; sel=null; render();
+// Alternate colours between games: it varies the evidence the identifier sees
+// and keeps the visitor from playing five games of the same opening.
+$("mnew").onclick=()=>{ human = human==="w"?"b":"w"; newGame(); };
+
+// The username persists so it survives a reload mid-session.
+$("ptarget").value = localStorage.getItem("cp_probe") || "";
+$("ptarget").addEventListener("change", ()=>{
+  localStorage.setItem("cp_probe", $("ptarget").value.trim());
+  refreshWho();
+});
+
+// Two-step inline confirm rather than window.confirm(). Native dialogs are
+// suppressed in embedded webviews -- this page runs in one, where confirm()
+// silently returns false and the button did nothing at all. An in-page
+// confirmation also cannot be blocked by a popup setting.
+let clearArm = null;
+function disarmClear(){
+  clearTimeout(clearArm); clearArm = null;
+  const b = $("clear");
+  b.textContent = "Clear my games";
+  b.classList.remove("danger");
+}
+$("clear").onclick = ()=>{
+  const b = $("clear");
+  if(!finished.length){
+    b.textContent = "nothing to clear";
+    setTimeout(disarmClear, 1400);
+    return;
+  }
+  if(clearArm === null){
+    b.textContent = `Clear ${finished.length}? Click again`;
+    b.classList.add("danger");
+    clearArm = setTimeout(disarmClear, 4000);
+    return;
+  }
+  disarmClear();
+  finished = [];
+  localStorage.removeItem("cp_games");
+  paintConfidence();
+  // Reset the panels too: leaving the last guess on screen after clearing would
+  // suggest it still had games behind it.
+  $("idlabel").innerHTML = "play a game and we'll guess who you are";
+  document.querySelector("#who tbody").innerHTML = "";
+  $("giveup").classList.add("hidden");
+  paintProbe(null);
 };
-$("hint").onclick=async()=>{
-  S = await post("/api/hint",{history:S.history}); S.last=null; render();
+
+$("sound").onclick = ()=>{
+  soundOn = !soundOn;
+  localStorage.setItem("cp_sound", soundOn ? "1" : "0");
+  $("sound").textContent = soundOn ? "🔊" : "🔇";
+  if(soundOn) SFX.move();               // confirm it audibly
 };
-$("temp").oninput=e=>{
-  const v=+e.target.value/100;
-  $("tempv").textContent = v===0? "greedy" : "T = "+v.toFixed(2);
-};
+$("sound").textContent = soundOn ? "🔊" : "🔇";
+
+paintConfidence();
+refreshWho();
 newGame();
 </script>
 </body>

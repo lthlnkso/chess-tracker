@@ -348,3 +348,291 @@ def loss_and_stats(logits_move, logits_promo, moves, pad_mask):
         acc = (pred == tm).float().mean()
         top5 = (lm.topk(5, dim=-1).indices == tm[:, None]).any(-1).float().mean()
     return loss, {"acc": acc.item(), "top5": top5.item(), "n": int(valid.sum())}
+
+
+# --- multi-task pre-training ------------------------------------------------
+
+class MultiTaskModel(nn.Module):
+    """One trunk, four heads.
+
+        trunk  -> per-ply hidden states
+          |- move head   (per-ply)  score candidate successor positions
+          |- time head   (per-ply)  predict log1p(ms) of the *upcoming* move
+          |- elo head    (pooled)   predict the attributed player's rating
+          `- embed head  (pooled)   128-d player vector, fed the Elo estimate
+
+    Per-ply input is the board planes plus `n_extra` clock features. The Elo
+    head is deliberately kept at deployment: its output feeds the embedding, and
+    a rating estimate also prunes the retrieval gallery.
+    """
+
+    def __init__(self, c: Config = Config(), n_planes: int = 8,
+                 n_extra: int = 2, d_embed: int = 128,
+                 n_time_bins: int = 9, n_elo_bins: int = 20, n_game_slots: int = 1,
+                 elo_cond: bool = False):
+        super().__init__()
+        self.cfg = c
+        self.n_planes = n_planes
+        self.n_extra = n_extra
+        self.d_embed = d_embed
+        self.n_time_bins = n_time_bins
+        self.n_elo_bins = n_elo_bins
+        self.n_game_slots = n_game_slots
+        d_in = n_planes * SQ + n_extra
+
+        self.in_proj = nn.Linear(d_in, c.d_model)
+        self.pos = nn.Embedding(c.max_len, c.d_model)
+        # Marks which game a position belongs to. Ply index stays per-game so
+        # "ply 3" means the same thing everywhere; without this the model could
+        # not tell a game boundary from an ordinary move.
+        self.game_emb = nn.Embedding(max(n_game_slots, 1), c.d_model) \
+            if n_game_slots > 1 else None
+        self.drop = nn.Dropout(c.dropout)
+        self.blocks = nn.ModuleList(Block(c) for _ in range(c.n_layers))
+        self.ln_f = nn.LayerNorm(c.d_model)
+
+        # move head: candidates share this encoder, scored by dot product
+        self.cand_enc = nn.Sequential(
+            nn.Linear(n_planes * SQ, c.d_ff), nn.GELU(),
+            nn.Linear(c.d_ff, c.d_model), nn.GELU(),
+            nn.Linear(c.d_model, c.d_model),
+        )
+        self.ln_c = nn.LayerNorm(c.d_model)
+        self.scale = c.d_model ** -0.5
+
+        # Both auxiliaries are classifiers, not regressors. Think time is a
+        # small integer count (85% of bullet plies are 0/1/2 s) and rating is
+        # ordinal -- a softmax fits both far better than squared error, and
+        # yields a distribution rather than a point estimate.
+        self.time_head = nn.Sequential(
+            nn.Linear(c.d_model, c.d_model // 2), nn.GELU(),
+            nn.Linear(c.d_model // 2, n_time_bins),
+        )
+        self.elo_head = nn.Sequential(
+            nn.Linear(c.d_model, c.d_model // 2), nn.GELU(),
+            nn.Linear(c.d_model // 2, n_elo_bins),
+        )
+        # pooled hidden state + predicted Elo + pooled time summary
+        self.embed_head = nn.Sequential(
+            nn.Linear(c.d_model + n_elo_bins + n_extra, c.d_model), nn.GELU(),
+            nn.Linear(c.d_model, d_embed),
+        )
+        # Optional rating conditioning. score_candidates() is a dot product of
+        # the trunk state with candidate encodings, so nothing about the model's
+        # MOVE choice can depend on rating unless rating enters the trunk -- the
+        # elo_head only ever fed embed_head. Adding it here makes the played
+        # style settable at inference, which is the point: the demo's opponent
+        # currently plays a single blend averaged over every rating in the data,
+        # matching no human in the gallery.
+        #
+        # One extra row is the "unknown rating" slot, used for games where the
+        # dump carries no rating and as the inference default. Zero-init means a
+        # checkpoint that has never trained this is bit-identical to before.
+        self.elo_cond = (nn.Embedding(n_elo_bins + 1, c.d_model)
+                         if elo_cond else None)
+        self.apply(ChessTransformer._init)
+        if self.elo_cond is not None:
+            nn.init.zeros_(self.elo_cond.weight)
+
+    # -- trunk ------------------------------------------------------------
+    def encode(self, planes, extra, game_slot=None, ply_pos=None, elo_bin=None):
+        b, t = planes.shape[:2]
+        x = planes.reshape(b, t, -1).to(self.in_proj.weight.dtype)
+        if self.n_extra:
+            x = torch.cat([x, extra.to(x.dtype)], dim=-1)
+        if ply_pos is None:
+            ply_pos = torch.arange(t, device=planes.device)[None].expand(b, t)
+        x = self.in_proj(x) + self.pos(ply_pos.clamp(max=self.pos.num_embeddings - 1))
+        if self.game_emb is not None and game_slot is not None:
+            x = x + self.game_emb(game_slot.clamp(max=self.game_emb.num_embeddings - 1))
+        if self.elo_cond is not None:
+            # One rating per sample, broadcast over its plies.
+            if elo_bin is None:
+                elo_bin = torch.full((b,), self.elo_cond.num_embeddings - 1,
+                                     dtype=torch.long, device=planes.device)
+            x = x + self.elo_cond(elo_bin.clamp(
+                max=self.elo_cond.num_embeddings - 1))[:, None, :]
+        x = self.drop(x)
+        for blk in self.blocks:
+            x = blk(x)
+        return self.ln_f(x)
+
+    def _pool(self, h, pad_mask, my_turn=None):
+        keep = ~pad_mask
+        if my_turn is not None:
+            keep = keep & my_turn
+        w = keep.unsqueeze(-1).to(h.dtype)
+        return (h * w).sum(1) / w.sum(1).clamp(min=1)
+
+    # -- heads ------------------------------------------------------------
+    def score_candidates(self, h, cands, ply_idx):
+        ctx = h.gather(1, ply_idx[..., None].expand(-1, -1, h.size(-1)))
+        B, P, C = cands.shape[:3]
+        e = self.ln_c(self.cand_enc(cands.reshape(B, P, C, -1).to(ctx.dtype)))
+        return torch.einsum("bpd,bpcd->bpc", ctx, e) * self.scale
+
+    def forward(self, planes, extra, cands, ply_idx, pad_mask, my_turn=None,
+                game_slot=None, ply_pos=None, elo_bin=None):
+        h = self.encode(planes, extra, game_slot, ply_pos, elo_bin)
+        move_logits = self.score_candidates(h, cands, ply_idx)
+        time_logits = self.time_head(h)                       # (B, T, n_time_bins)
+        pooled = self._pool(h, pad_mask, my_turn)
+        elo_logits = self.elo_head(pooled)                    # (B, n_elo_bins)
+        return move_logits, time_logits, elo_logits, pooled, h
+
+    def embed(self, planes, extra, pad_mask, my_turn=None, game_slot=None,
+              ply_pos=None, elo_bin=None):
+        """128-d player vector. Elo estimate and pooled clock stats feed in."""
+        h = self.encode(planes, extra, game_slot, ply_pos, elo_bin)
+        pooled = self._pool(h, pad_mask, my_turn)
+        elo_logits = self.elo_head(pooled)
+        elo_p = F.softmax(elo_logits.float(), dim=-1)          # (B, n_elo_bins)
+        keep = (~pad_mask if my_turn is None else (~pad_mask & my_turn))
+        w = keep.unsqueeze(-1).to(extra.dtype)
+        time_summary = (extra * w).sum(1) / w.sum(1).clamp(min=1)   # (B, n_extra)
+        z = torch.cat([pooled, elo_p.to(pooled.dtype),
+                       time_summary.to(pooled.dtype)], dim=-1)
+        return F.normalize(self.embed_head(z), dim=-1), elo_logits
+
+
+# Defaults only. The real population mean for 2026 60+0 is ~1816, not 1500, so a
+# hardcoded centre makes the head fight weight decay to learn a large bias for
+# nothing. Callers should pass statistics measured on the shard.
+# --- Elo binning -----------------------------------------------------------
+# Fixed 100-point bins with saturating ends. Targets are smoothed across
+# neighbouring bins because rating is *ordinal*: predicting 1900 for a 1850
+# player should cost far less than predicting 1200, and plain one-hot
+# cross-entropy treats those two mistakes identically.
+
+ELO_LO, ELO_HI, ELO_BIN = 800.0, 2600.0, 100.0
+N_ELO_BINS = int((ELO_HI - ELO_LO) / ELO_BIN) + 2      # + below / above
+ELO_CENTRES = torch.tensor(
+    [ELO_LO - ELO_BIN / 2] +
+    [ELO_LO + ELO_BIN * (i + 0.5) for i in range(int((ELO_HI - ELO_LO) / ELO_BIN))] +
+    [ELO_HI + ELO_BIN / 2])
+
+
+def elo_to_bin(elo):
+    """Rating -> index into ELO_CENTRES; N_ELO_BINS means "unknown".
+
+    Bin 0 is everything below ELO_LO and the last real bin everything above
+    ELO_HI, matching how ELO_CENTRES is laid out. Ratings of 0 (absent from the
+    dump) map to the unknown slot rather than being silently treated as 800.
+    """
+    e = torch.as_tensor(elo)
+    idx = torch.floor((e.float() - ELO_LO) / ELO_BIN).long() + 1
+    idx = idx.clamp(0, N_ELO_BINS - 1)
+    return torch.where(e > 0, idx, torch.full_like(idx, N_ELO_BINS))
+
+
+def elo_soft_targets(elo, sigma_bins: float = 1.0):
+    """Gaussian mass over adjacent bins, centred on the true rating."""
+    c = ELO_CENTRES.to(elo.device)
+    d = (elo.float()[:, None] - c[None, :]) / (sigma_bins * ELO_BIN)
+    t = torch.softmax(-0.5 * d.pow(2), dim=-1)
+    return t
+
+
+def elo_expectation(logits):
+    """Point estimate for reporting: expected value under the predicted bins."""
+    return (torch.softmax(logits.float(), -1) * ELO_CENTRES.to(logits.device)).sum(-1)
+
+
+WP_K = 0.00368208            # centipawn -> win probability (lichess constant)
+
+
+def cpl_loss(move_logits, batch):
+    """Expected squared win-probability error against the move the human played.
+
+        loss = sum_i p_i * (WP_i - WP_human)^2
+
+    Cross-entropy treats all 31 non-played candidates as equally wrong. This
+    grades them: a candidate of the SAME quality as the human's move costs
+    nothing, and a blunder costs a lot -- so the trunk learns the player's error
+    profile rather than their exact moves. Symmetric on purpose. Predicting a
+    move much BETTER than the human played is penalised as hard as a blunder,
+    because a model of this player should not be a stronger player.
+
+    Win probability, not centipawns: candidates span ~550cp and a third are
+    >=300cp blunders, so a raw-cp target is dominated by moves the model already
+    avoids. The logistic bounds the term in [0,1] and puts its gradient where
+    the position is still in the balance.
+
+    Plies with no corpus entry are dropped, not zero-filled -- an unlabelled ply
+    carries no information about quality and must not vote for uniformity.
+    """
+    ev = batch["cand_eval"]                              # (B, S, C) cp, NaN = unknown
+    known = batch["cand_mask"] & ~torch.isnan(ev)
+    rows = batch["ply_mask"] & batch["cpl_ok"] & known.any(-1)
+    if not bool(rows.any()):
+        return None, 0
+
+    wp = torch.sigmoid(WP_K * torch.nan_to_num(ev.float(), nan=0.0))
+    lab = batch["label"].unsqueeze(-1)
+    wp_j = wp.gather(-1, lab)                            # the human's move
+    known_j = known.gather(-1, lab).squeeze(-1)
+    rows = rows & known_j                                # need the human's own eval
+    if not bool(rows.any()):
+        return None, 0
+
+    logits = move_logits.masked_fill(~known, float("-inf"))
+    p = torch.softmax(logits.float(), -1)
+    p = torch.where(known, p, torch.zeros_like(p))
+    d2 = (wp - wp_j) ** 2
+    per_ply = (p * d2).sum(-1)
+    return per_ply[rows].mean(), int(rows.sum().item())
+
+
+def multitask_loss(move_logits, time_logits, elo_logits, batch, w_move=1.0,
+                   w_time=0.3, w_elo=0.3, time_centres=None, w_cpl=0.0):
+    """Weighted sum of the three objectives, each reported in its own units."""
+    out = {}
+    loss, _ = successor_loss(move_logits, batch["label"], batch["cand_mask"],
+                             batch["ply_mask"])
+    with torch.no_grad():
+        sel = batch["ply_mask"] & batch["cand_mask"].any(-1)
+        lg = move_logits.masked_fill(~batch["cand_mask"], float("-inf"))[sel]
+        out["move_acc"] = (lg.argmax(-1) == batch["label"][sel]).float().mean().item()
+    out["move"] = loss.item()
+    total = w_move * loss
+
+    if w_cpl > 0.0 and "cand_eval" in batch:
+        cl, n = cpl_loss(move_logits, batch)
+        if cl is not None:
+            out["cpl"] = cl.item()
+            out["cpl_plies"] = n
+            total = total + w_cpl * cl
+        else:
+            out["cpl"] = float("nan")
+            out["cpl_plies"] = 0
+
+    tvalid = batch["time_valid"] & ~batch["pad_mask"]
+    if tvalid.any():
+        tl = F.cross_entropy(time_logits[tvalid].float(), batch["time_target"][tvalid])
+        out["time"] = tl.item()
+        with torch.no_grad():
+            pred = time_logits[tvalid].float().argmax(-1)
+            out["time_acc"] = (pred == batch["time_target"][tvalid]).float().mean().item()
+            if time_centres is not None:
+                cen = time_centres.to(time_logits.device)
+                exp_s = (torch.softmax(time_logits[tvalid].float(), -1) * cen).sum(-1)
+                out["time_mae_s"] = (exp_s - cen[batch["time_target"][tvalid]]).abs().mean().item()
+        total = total + w_time * tl
+    else:
+        out["time"] = float("nan")
+
+    evalid = batch["elo"] > 0
+    if evalid.any():
+        tgt = elo_soft_targets(batch["elo"][evalid])
+        lp = F.log_softmax(elo_logits[evalid].float(), dim=-1)
+        el = -(tgt * lp).sum(-1).mean()
+        out["elo"] = el.item()
+        with torch.no_grad():
+            est = elo_expectation(elo_logits[evalid])
+            out["elo_mae"] = (est - batch["elo"][evalid].float()).abs().mean().item()
+        total = total + w_elo * el
+    else:
+        out["elo"] = float("nan")
+
+    out["total"] = total.item()
+    return total, out
