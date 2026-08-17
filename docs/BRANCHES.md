@@ -76,6 +76,30 @@ pattern would say the long-context path is undertrained rather than useless.
 
 ---
 
+## SETTLED (negative): gallery centroid depth
+
+**Tested 2026-08-17, dead.** `--gallery-games 64` truncates to whole k=10
+bundles, so centroids use exactly 60 games and 59% of the gallery piles up
+there. The obvious question was whether a deeper centroid is a cleaner target.
+
+Two arms, same shard, same 50,000 players, same 2,000 held-out queries:
+
+| --gallery-games | mean centroid | r@1 | r@10 |
+|---|---|---|---|
+| 60 | 44.6 games | 0.9250 | 0.9830 |
+| 128 | 73.1 games | 0.9245 | 0.9820 |
+
+**1.64x the centroid depth bought nothing** — deltas of −0.0005 (0.08 sigma) and
+−0.0010 (0.35 sigma). The centroid saturates well before 60 games, so the
+inherited cap is not costing us anything and a full rebuild at 128 (~10 h,
+~$2.50) would be wasted money.
+
+Note this is the GALLERY side only. Query-side depth is a completely different
+story and still the biggest lever we have: r@10 goes 0.790 at ten query games to
+0.867 at thirty.
+
+---
+
 ## 4. d_embed 128 vs 64
 
 **Chose:** 128, deferred the change.
