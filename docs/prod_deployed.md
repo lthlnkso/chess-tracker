@@ -44,8 +44,8 @@ serving on http://localhost:8010
 | `ckpt/final/ctx5_pre.pt` | 31,726,363 | `5416f7a7eab46935aadfe74ddbe2fe97d10477fb293b8b922fa34a6dec2f9379` |
 | `ckpt/final/ctx10_ft.pt` | 97,241,235 | `b230917f935d33b12a038257f1b9fdaf85316f9b1b467e371047dce58070b7a8` |
 | `play/gallery_ctx10.npz` | 137,162,027 | `24908fbd6598011a8fcda3c211ff9907b6c2e269875c5b27b342482ba5b737b3` |
-| `play/index.html` | — | `aba005a9c026b668a260887ae99296aa5694896d83bf6b77ba830ca90a5e9e72` |
-| `play/server.py` | — | `179b605a848c56f55f1239ce96bfe1780381012a6d9e692cd0513f1f7b67cd00` |
+| `play/index.html` | — | `90396b0aae686d8078dfa154b0d840f3ca7b20dfc5911a4974f1dd1447087522` |
+| `play/server.py` | — | `0e1c1c13887872d537c474a406763abfd691f75687c70ffe13dba7e8de39dd54` |
 
 ```bash
 shasum -a 256 ckpt/final/ctx5_pre.pt ckpt/final/ctx10_ft.pt play/gallery_ctx10.npz play/index.html play/server.py
@@ -389,6 +389,79 @@ Gated in **two** places, and the endpoint gate is the one that matters:
 
 Verified: without `--dev`, `/api/save` → 404 while `/api/giveup` and `/api/claim`
 → 200.
+
+---
+
+## Deploying to a host
+
+The demo serves its own HTML and its own API from one process, so it is a single
+service — there is nothing to split between a web host and an API host, and
+splitting it would only add CORS.
+
+### Sizing
+
+**Peak resident memory is 829 MB**, measured by loading the real stack:
+
+| stage | RSS |
+|---|---|
+| python + numpy + torch | 202 MB |
+| + `ctx5_pre.pt` (bot) | 266 MB |
+| + `ctx10_ft.pt` (identifier) | 411 MB |
+| + gallery and name index | **829 MB** |
+
+A 1 GB instance will OOM. **2 GB is the minimum, 4 GB comfortable.** Most of the
+jump is the gallery: 558,735 x 128 float16 on disk is expanded to float32 for the
+matmul, which is 286 MB.
+
+### Capacity, measured
+
+At 10 concurrent clients on a laptop CPU, all requests succeeded:
+
+| endpoint | median | p95 |
+|---|---|---|
+| `/api/move` (once per bot move — the hot path) | 0.06 s | 0.10 s |
+| `/api/identify` (once per finished game) | 0.56 s | 0.73 s |
+
+Throughput plateaus near 17 req/s, CPU-bound. That comfortably carries 10-20
+simultaneous players and would not survive a front-page link.
+
+### Environment
+
+`PORT` and `HOST` are read from the environment, so a PaaS that assigns a port
+works with no flags. `HOST` still defaults to `127.0.0.1` — a container must opt
+in with `HOST=0.0.0.0`, because being inside a container is not by itself a
+reason to accept traffic from anywhere.
+
+`GET /healthz` returns `{"ok", "gallery", "id_slots"}`, 200 when the gallery is
+loaded and 503 otherwise. It runs no inference on purpose: a probe that did one
+would report unhealthy under exactly the load where staying in the pool matters.
+
+### Artifacts
+
+`Dockerfile` installs **CPU-only torch** (the default wheel pulls ~2.5 GB of CUDA
+this never uses) and runs `scripts/fetch_artifacts.sh` at build time, so a
+restart cannot fail on a network hiccup.
+
+```bash
+ARTIFACT_BASE=https://…            # any static host serving the three filenames
+ARTIFACT_BASE=s3://bucket/prefix   # uses awscli instead
+```
+
+The script **verifies sha256** against the manifest above and deletes the file on
+mismatch. That check is not ceremony: a substituted or truncated gallery does not
+crash, it identifies the wrong people with full confidence.
+
+The three files total 266 MB and are not in git. They must be published somewhere
+the build can reach — a GitHub Release on this repo is the default
+(`TAG=artifacts-ctx10`) and needs no credentials.
+
+### Still missing before a public link
+
+- **No rate limiting.** At a 17 req/s ceiling one client with a loop denies
+  service to everyone. Fine for a link sent to a handful of people; not fine for
+  a subreddit.
+- **No TLS in the process.** Terminate it at the platform's proxy.
+- **No auth**, by design — it is a public demo.
 
 ---
 

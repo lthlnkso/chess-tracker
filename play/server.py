@@ -916,6 +916,21 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
+        # Liveness for the platform's health check. Deliberately does NO
+        # inference: a probe that runs a forward pass would report unhealthy
+        # under exactly the load where staying in the pool matters most, and
+        # would add real work on every probe interval. It reports whether the
+        # model and gallery are loaded, which is the thing that can actually be
+        # wrong -- a process that booted without them serves 200s forever while
+        # identifying nobody.
+        if self.path in ("/healthz", "/health"):
+            ready = "ident" in MODEL and "cent" in MODEL
+            return self._send(200 if ready else 503, {
+                "ok": ready,
+                "gallery": MODEL.get("gal_n", 0),
+                "id_slots": MODEL.get("id_slots"),
+            })
+
         if self.path in ("/", "/index.html"):
             vid, is_new = self.visitor_id()
             with open(os.path.join(HERE, "index.html"), "rb") as f:
@@ -1218,13 +1233,18 @@ def main():
                     help="candidates' games, built by build_verifier_pack.py")
     ap.add_argument("--bayes", default=os.path.join(HERE, "bayes_calib.json"),
                     help="Platt coefficients from calibrate_bayes.py; optional")
-    ap.add_argument("--port", type=int, default=8000)
+    # PORT and HOST come from the environment when present: Railway, Render and
+    # most PaaS assign a port at runtime and the process must bind the one they
+    # give it. HOST still defaults to loopback, so a container has to opt in with
+    # HOST=0.0.0.0 -- being inside a container is not by itself a reason to
+    # accept traffic from anywhere.
+    ap.add_argument("--port", type=int, default=int(os.environ.get("PORT", 8000)))
     # Default stays LOOPBACK. Binding 0.0.0.0 has to be a deliberate act,
     # because this process has no authentication, no rate limiting and no TLS,
     # and every request costs a torch forward pass over a 137 MB gallery -- it
     # is trivially easy to knock over. Put a reverse proxy in front of it before
     # exposing it, and see docs/prod_deployed.md.
-    ap.add_argument("--host", default="127.0.0.1",
+    ap.add_argument("--host", default=os.environ.get("HOST", "127.0.0.1"),
                     help="bind address; use 0.0.0.0 to accept external "
                          "connections (put a proxy in front first)")
     ap.add_argument("--dev", action="store_true",
