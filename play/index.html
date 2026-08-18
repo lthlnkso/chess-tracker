@@ -247,6 +247,9 @@ const TARGET_GAMES=10;
 // panel ASKS for; MAX_QUERY_GAMES is what actually gets sent, and a visitor who
 // keeps playing gets the benefit without being nagged for thirty games.
 const MAX_QUERY_GAMES=30;      // = server MAX_BUNDLES * n_game_slots
+// Games required before the give-up button appears. Five is where the curve
+// says we usually already have you.
+const GIVEUP_MIN_GAMES=5;
 const TYPICAL=5;
 let times=[], moveStart=null, myClock=BASE_MS, clockTimer=null, botClock=BASE_MS;
 // The clock does not run until the visitor's first move. Otherwise it burns
@@ -894,7 +897,11 @@ async function refreshWho(){
   }).join("");
   tb.querySelectorAll("button.mine").forEach(b=>
     b.onclick = ()=>onClaimClick(b.dataset.name));
-  $("giveup").classList.remove("hidden");
+  // Only offer "none of these are me" once we have had a fair shot. Measured
+  // r@10 is 0.487 at three games but 0.657 at five, so inviting a visitor to
+  // give up early mostly collects people we WOULD have found -- which is both a
+  // worse experience and worse data, since giveups are our labelled misses.
+  $("giveup").classList.toggle("hidden", finished.length < GIVEUP_MIN_GAMES);
 }
 
 // --- claiming -------------------------------------------------------------
