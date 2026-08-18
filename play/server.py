@@ -14,6 +14,7 @@ would silently produce a weaker opponent and nothing would ever flag it.
 from __future__ import annotations
 
 import argparse
+import hmac
 import http.cookies
 import json
 import os
@@ -461,6 +462,9 @@ _SIM_CHUNK = 25_000
 # that ceiling visible and survivable instead of fatal.
 QUEUE_PATH = os.environ.get("QUEUE_PATH", os.path.join(HERE, "jobs.db"))
 IDENTIFY_WORKERS = int(os.environ.get("IDENTIFY_WORKERS", "1"))
+# Shared secret for remote workers. Empty disables the worker endpoints
+# entirely, so a box that has not been given a token cannot be enlisted.
+WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "")
 JOBS = None
 
 
@@ -471,7 +475,7 @@ def _worker_loop(n):
             if job is None:
                 time.sleep(0.25)
                 continue
-            jid, payload = job
+            jid, kind, payload = job
             try:
                 with _IDENTIFY_SEM:
                     res = identify(payload.get("games") or [],
@@ -1307,6 +1311,40 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"saved": len(games), "file": f"{safe}.json"})
             except Exception as e:                       # noqa: BLE001
                 return self._send(500, {"error": str(e)})
+
+        if self.path.startswith("/api/worker/"):
+            # Remote workers. The queue lives here because this box is cheap and
+            # always up; the COMPUTE lives wherever capacity is cheapest at the
+            # time -- a GPU pod during a traffic spike, nothing at 3am. Workers
+            # need no inbound port and no fixed address: they dial in.
+            if not WORKER_TOKEN:
+                return self._send(503, {"error": "workers not enabled"})
+            tok = self.headers.get("X-Worker-Token", "")
+            # compare_digest: a plain == leaks the token one byte at a time to
+            # anyone willing to time the responses.
+            if not hmac.compare_digest(tok, WORKER_TOKEN):
+                return self._send(403, {"error": "bad worker token"})
+            if JOBS is None:
+                return self._send(503, {"error": "queue not running"})
+
+            if self.path == "/api/worker/claim":
+                kinds = req.get("kinds") or None
+                job = JOBS.claim(kinds)
+                if job is None:
+                    return self._send(200, {})
+                jid, kind, payload = job
+                return self._send(200, {"job": jid, "kind": kind,
+                                        "payload": payload})
+
+            if self.path == "/api/worker/result":
+                jid = req.get("job")
+                if not jid:
+                    return self._send(400, {"error": "no job"})
+                JOBS.finish(int(jid), req.get("result"),
+                            failed=bool(req.get("failed")))
+                return self._send(200, {"ok": True})
+
+            return self._send(404, {"error": "not found"})
 
         if self.path == "/api/identify/async":
             # Enqueue and return immediately. The sync /api/identify below is

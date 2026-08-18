@@ -24,6 +24,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     state    TEXT NOT NULL,           -- queued | running | done | failed
+    kind     TEXT NOT NULL DEFAULT 'identify',   -- identify | move
     payload  TEXT NOT NULL,
     result   TEXT,
     created  REAL NOT NULL,
@@ -42,6 +43,14 @@ class JobQueue:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with self._conn() as c:
             c.executescript(SCHEMA)
+            # CREATE TABLE IF NOT EXISTS silently does nothing to a table that
+            # already exists, so a schema change ships fine and then fails at
+            # runtime on the one machine that has old data -- which is exactly
+            # what happened in production on 2026-08-18. Migrate explicitly.
+            cols = {r[1] for r in c.execute("PRAGMA table_info(jobs)")}
+            if "kind" not in cols:
+                c.execute("ALTER TABLE jobs ADD COLUMN "
+                          "kind TEXT NOT NULL DEFAULT 'identify'")
 
     def _conn(self):
         # check_same_thread=False: the server hands connections to worker
@@ -51,22 +60,32 @@ class JobQueue:
         c.execute("PRAGMA busy_timeout=30000")
         return c
 
-    def submit(self, payload, vid=None):
+    def submit(self, payload, vid=None, kind="identify"):
         with self._conn() as c:
             cur = c.execute(
-                "INSERT INTO jobs(state,payload,created,vid) VALUES('queued',?,?,?)",
-                (json.dumps(payload), time.time(), vid))
+                "INSERT INTO jobs(state,kind,payload,created,vid) "
+                "VALUES('queued',?,?,?,?)",
+                (kind, json.dumps(payload), time.time(), vid))
             return cur.lastrowid
 
-    def claim(self):
-        """Atomically take the oldest queued job, or None."""
+    def claim(self, kinds=None):
+        """Atomically take the oldest queued job, or None.
+
+        `kinds` lets a worker take only what it is built for -- a GPU box can
+        claim identify work while a cheap box handles moves, without either
+        needing to know the other exists.
+        """
+        where = "state='queued'"
+        args = []
+        if kinds:
+            where += " AND kind IN (%s)" % ",".join("?" * len(kinds))
+            args += list(kinds)
         with self._conn() as c:
             row = c.execute(
-                "UPDATE jobs SET state='running', started=? "
-                "WHERE id=(SELECT id FROM jobs WHERE state='queued' "
-                "          ORDER BY id LIMIT 1) RETURNING id, payload",
-                (time.time(),)).fetchone()
-            return (row[0], json.loads(row[1])) if row else None
+                f"UPDATE jobs SET state='running', started=? "
+                f"WHERE id=(SELECT id FROM jobs WHERE {where} ORDER BY id LIMIT 1) "
+                f"RETURNING id, kind, payload", [time.time()] + args).fetchone()
+            return (row[0], row[1], json.loads(row[2])) if row else None
 
     def finish(self, job_id, result, failed=False):
         with self._conn() as c:
