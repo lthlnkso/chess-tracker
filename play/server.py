@@ -37,6 +37,18 @@ from bitboards import decode_move, board_to_planes8, N_PLANES13  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODEL = {}
+# Where inference runs. The web process stays on CPU; a remote worker on a GPU
+# box sets DEVICE=cuda, which is the whole point of letting workers live
+# elsewhere -- the queue host never needs a GPU.
+DEVICE = torch.device(os.environ.get("DEVICE", "cpu"))
+
+
+def _dev(*ts):
+    """Move a batch of tensors to DEVICE. A no-op on CPU."""
+    if DEVICE.type == "cpu":
+        return ts if len(ts) > 1 else ts[0]
+    out = tuple(t.to(DEVICE, non_blocking=True) for t in ts)
+    return out if len(out) > 1 else out[0]
 
 
 def _build(ck):
@@ -48,6 +60,7 @@ def _build(ck):
                        elo_cond=bool(ck.get("elo_cond")))
     m.load_state_dict(ck["model"])
     m.eval()
+    m.to(DEVICE)
     return m, cfg
 
 
@@ -259,7 +272,7 @@ def load(move_ckpt: str, id_ckpt: str, gallery: str):
         # resident -- a third of the whole process -- and was also SLOWER: a
         # chunked fp16 matmul measured 53 ms against 455 ms, because it never
         # materialises the big float32 copy. See gallery_sims().
-        MODEL.update(cent=torch.from_numpy(g["centroids"]),
+        MODEL.update(cent=torch.from_numpy(g["centroids"]).to(DEVICE),
                      names=names, gal_k=int(g["k"]), gal_n=len(g["pids"]),
                      # Lowercased lookup for the test-only rank probe. Built once
                      # here rather than scanned per request: at 558k names a
@@ -329,15 +342,15 @@ def think(history_moves: list[str], temperature: float, times=None, elo=None):
     eb = None
     if getattr(m, "elo_cond", None) is not None and elo:
         eb = elo_to_bin(torch.tensor([int(elo)]))
-    out = m(torch.from_numpy(planes),
-            torch.from_numpy(fe)[None],
-            torch.from_numpy(cands),
-            torch.tensor([[T - 1]]),
-            torch.zeros((1, T), dtype=torch.bool),
-            torch.from_numpy(my_turn),
-            torch.zeros((1, T), dtype=torch.long),      # single game -> slot 0
-            torch.arange(T)[None],
-            elo_bin=eb)
+    out = m(*_dev(torch.from_numpy(planes),
+                  torch.from_numpy(fe)[None],
+                  torch.from_numpy(cands)),
+            *_dev(torch.tensor([[T - 1]]),
+                  torch.zeros((1, T), dtype=torch.bool),
+                  torch.from_numpy(my_turn),
+                  torch.zeros((1, T), dtype=torch.long),   # single game -> slot 0
+                  torch.arange(T)[None]),
+            elo_bin=eb if eb is None else eb.to(DEVICE))
     logits = out[0][0, 0, :len(legal)]
     probs = torch.softmax(logits if temperature <= 0 else logits / temperature, -1)
 
@@ -516,7 +529,11 @@ def gallery_sims(q):
     costing memory.
     """
     cent = MODEL["cent"]
-    q = q.reshape(-1).float()
+    q = q.reshape(-1).float().to(cent.device)
+    if cent.device.type != "cpu":
+        # On a GPU the whole bank is resident and fp16 matmul is native, so
+        # chunking would only add launch overhead for no memory benefit.
+        return (cent @ q.half()).float().cpu()
     out = torch.empty(cent.shape[0])
     for i in range(0, cent.shape[0], _SIM_CHUNK):
         out[i:i + _SIM_CHUNK] = cent[i:i + _SIM_CHUNK].float() @ q
@@ -757,12 +774,12 @@ def identify(games: list[dict], topn: int = 10, target: str | None = None,
             slot[0, at:at + t] = min(si, slots - 1)
             ppos[0, at:at + t] = np.arange(t)      # ply index restarts per game
             at += t
-        e, elo_logits = m.embed(torch.from_numpy(planes),
-                                torch.from_numpy(extra),
-                                torch.zeros((1, T), dtype=torch.bool),
-                                torch.from_numpy(mine),
-                                torch.from_numpy(slot),
-                                torch.from_numpy(ppos))
+        e, elo_logits = m.embed(*_dev(torch.from_numpy(planes),
+                                      torch.from_numpy(extra),
+                                      torch.zeros((1, T), dtype=torch.bool),
+                                      torch.from_numpy(mine),
+                                      torch.from_numpy(slot),
+                                      torch.from_numpy(ppos)))
         return torch.nn.functional.normalize(e.float(), dim=-1), elo_logits
 
     def build_blocks(sel):
