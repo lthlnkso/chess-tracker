@@ -49,6 +49,8 @@ def main():
     ap.add_argument("--ckpt", default="ckpt/final/ctx5_pre.pt")
     ap.add_argument("--id-ckpt", default="ckpt/final/ctx10_ft.pt")
     ap.add_argument("--gallery", default="play/gallery_ctx10.npz")
+    ap.add_argument("--batch", type=int, default=1,
+                    help="jobs to claim per round trip; the point of a GPU worker")
     ap.add_argument("--idle-sleep", type=float, default=0.5)
     ap.add_argument("--max-idle-sleep", type=float, default=5.0)
     args = ap.parse_args()
@@ -66,7 +68,8 @@ def main():
     done = 0
     while True:
         try:
-            job = call(args.api, "/api/worker/claim", token, {"kinds": kinds})
+            job = call(args.api, "/api/worker/claim", token,
+                       {"kinds": kinds, "max": args.batch})
         except urllib.error.HTTPError as e:
             print(f"claim failed: HTTP {e.code}", file=sys.stderr, flush=True)
             time.sleep(5.0)
@@ -76,7 +79,9 @@ def main():
             time.sleep(5.0)
             continue
 
-        if not job:
+        batch = job.get("jobs") if isinstance(job, dict) and "jobs" in job else (
+            [job] if job else [])
+        if not batch:
             # Back off when idle so an empty queue is not a busy-loop against
             # the host we are trying to keep cheap.
             time.sleep(sleep)
@@ -84,39 +89,41 @@ def main():
             continue
         sleep = args.idle_sleep
 
-        jid, kind, payload = job["job"], job.get("kind", "identify"), job["payload"]
-        failed, result = False, None
-        try:
-            if kind == "identify":
-                result = server.identify(payload.get("games") or [],
-                                         target=payload.get("target"))
-                result = result or {"top": [], "games_used": 0,
-                                    "gallery": server.MODEL.get("gal_n", 0)}
-            elif kind == "move":
-                choice, ranked = server.think(
-                    list(payload.get("history") or []),
-                    float(payload.get("temperature") or 0.0),
-                    payload.get("times"), payload.get("elo"))
-                result = {"uci": choice, "ranked": ranked[:5] if ranked else []}
-            else:
-                failed, result = True, {"error": f"unknown kind {kind}"}
-        except Exception as e:                            # noqa: BLE001
-            failed, result = True, {"error": str(e)[:200]}
-            print(f"job {jid} ({kind}) failed: {e}", file=sys.stderr, flush=True)
+        results = []
+        for jb in batch:
+            jid, kind, payload = jb["job"], jb.get("kind", "identify"), jb["payload"]
+            failed, result = False, None
+            try:
+                if kind == "identify":
+                    result = server.identify(payload.get("games") or [],
+                                             target=payload.get("target"))
+                    result = result or {"top": [], "games_used": 0,
+                                        "gallery": server.MODEL.get("gal_n", 0)}
+                elif kind == "move":
+                    choice, ranked = server.think(
+                        list(payload.get("history") or []),
+                        float(payload.get("temperature") or 0.0),
+                        payload.get("times"), payload.get("elo"))
+                    result = {"uci": choice, "ranked": ranked[:5] if ranked else []}
+                else:
+                    failed, result = True, {"error": f"unknown kind {kind}"}
+            except Exception as e:                        # noqa: BLE001
+                failed, result = True, {"error": str(e)[:200]}
+                print(f"job {jid} ({kind}) failed: {e}", file=sys.stderr, flush=True)
+            results.append({"job": jid, "result": result, "failed": failed})
 
         for attempt in range(5):
             try:
-                call(args.api, "/api/worker/result", token,
-                     {"job": jid, "result": result, "failed": failed})
+                call(args.api, "/api/worker/result", token, {"results": results})
                 break
             except Exception as e:                        # noqa: BLE001
-                # Never drop a finished result on a transient network blip --
-                # the visitor is waiting on it, and reap() would only requeue
+                # Never drop finished results on a transient network blip -- the
+                # visitors are waiting on them, and reap() would only requeue
                 # work we have already paid for.
                 print(f"result post retry {attempt+1}: {e}", file=sys.stderr, flush=True)
                 time.sleep(2 ** attempt)
 
-        done += 1
+        done += len(results)
         if done % 25 == 0:
             print(f"worker: {done} jobs done", file=sys.stderr, flush=True)
 

@@ -1346,14 +1346,24 @@ class Handler(BaseHTTPRequestHandler):
 
             if self.path == "/api/worker/claim":
                 kinds = req.get("kinds") or None
-                job = JOBS.claim(kinds)
-                if job is None:
-                    return self._send(200, {})
-                jid, kind, payload = job
-                return self._send(200, {"job": jid, "kind": kind,
-                                        "payload": payload})
+                # `max` lets a fast worker take a batch. One job per round trip
+                # left a GPU at 0% utilisation -- 95 ms of compute behind two
+                # HTTP hops -- so the batch is what makes remote GPUs worth
+                # renting. Capped so one worker cannot drain the whole queue and
+                # strand every other worker idle.
+                n = max(1, min(int(req.get("max") or 1), 64))
+                jobs = JOBS.claim_batch(n, kinds)
+                out = [{"job": j, "kind": k, "payload": p} for j, k, p in jobs]
+                # Single-job shape kept for compatibility with older workers.
+                if n == 1:
+                    return self._send(200, out[0] if out else {})
+                return self._send(200, {"jobs": out})
 
             if self.path == "/api/worker/result":
+                items = req.get("results")
+                if items:
+                    JOBS.finish_many(items)
+                    return self._send(200, {"ok": True, "n": len(items)})
                 jid = req.get("job")
                 if not jid:
                     return self._send(400, {"error": "no job"})

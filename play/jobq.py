@@ -87,6 +87,37 @@ class JobQueue:
                 f"RETURNING id, kind, payload", [time.time()] + args).fetchone()
             return (row[0], row[1], json.loads(row[2])) if row else None
 
+    def claim_batch(self, n, kinds=None):
+        """Claim up to n jobs in ONE statement.
+
+        The single-job claim costs a network round trip per job, which on a GPU
+        worker is the whole cost: measured 95 ms of compute against two HTTP
+        hops, leaving the GPU at 0% utilisation. Claiming 16 at a time amortises
+        those hops 16x. UPDATE ... RETURNING is atomic over the whole set, so
+        two workers still cannot take the same job.
+        """
+        where = "state='queued'"
+        args = []
+        if kinds:
+            where += " AND kind IN (%s)" % ",".join("?" * len(kinds))
+            args += list(kinds)
+        with self._conn() as c:
+            rows = c.execute(
+                f"UPDATE jobs SET state='running', started=? "
+                f"WHERE id IN (SELECT id FROM jobs WHERE {where} ORDER BY id LIMIT ?) "
+                f"RETURNING id, kind, payload",
+                [time.time()] + args + [int(n)]).fetchall()
+        return [(r[0], r[1], json.loads(r[2])) for r in rows]
+
+    def finish_many(self, items):
+        """Report a batch of results in one transaction."""
+        now = time.time()
+        with self._conn() as c:
+            c.executemany(
+                "UPDATE jobs SET state=?, result=?, finished=? WHERE id=?",
+                [("failed" if it.get("failed") else "done",
+                  json.dumps(it.get("result")), now, int(it["job"])) for it in items])
+
     def finish(self, job_id, result, failed=False):
         with self._conn() as c:
             c.execute("UPDATE jobs SET state=?, result=?, finished=? WHERE id=?",
