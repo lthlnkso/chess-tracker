@@ -436,6 +436,22 @@ def load_claims():
 _SIM_CHUNK = 25_000
 
 
+# Bounded concurrency for the expensive path.
+#
+# Measured on the 1 vCPU deploy box: 16 simultaneous /api/identify calls drove
+# peak RSS into the 850 MB cgroup cap and the kernel OOM-KILLED the service --
+# every in-flight visitor got an error and the process restarted. Each call
+# holds a transient float32 chunk of the gallery plus the encoded query, so
+# memory scales with concurrency while throughput does not: on one core the
+# requests serialise anyway.
+#
+# So this costs nothing real and converts the failure mode from "the service
+# dies" into "the request waits", which is the difference between a visitor
+# seeing a slow page and seeing a broken one.
+IDENTIFY_SLOTS = int(os.environ.get("IDENTIFY_SLOTS", "2"))
+_IDENTIFY_SEM = threading.Semaphore(IDENTIFY_SLOTS)
+
+
 def gallery_sims(q):
     """Cosine similarity of one query against every centroid.
 
@@ -1230,8 +1246,10 @@ class Handler(BaseHTTPRequestHandler):
             # The server is stateless, so the browser keeps the visitor's
             # finished games and posts them back -- same contract as history.
             try:
-                res = identify(req.get("games") or [], target=req.get("target"),
-                               verify_depth=int(req.get("verify_depth") or 0))
+                with _IDENTIFY_SEM:
+                    res = identify(req.get("games") or [],
+                                   target=req.get("target"),
+                                   verify_depth=int(req.get("verify_depth") or 0))
             except Exception as e:                      # never break the game
                 print(f"identify failed: {e}", file=sys.stderr)
                 res = None
@@ -1393,6 +1411,11 @@ def main():
     if DEV:
         print("DEV MODE: save-games button exposed", file=sys.stderr)
     metrics.start()
+    # Python's default accept backlog is 5. Measured on the deploy box: at 16
+    # concurrent clients that produced 18,524 connection errors -- refusals, not
+    # slowness, which a visitor sees as "the site is down" rather than "the site
+    # is busy". A spike from a link post is exactly this shape.
+    ThreadingHTTPServer.request_queue_size = 128
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     if args.host not in ("127.0.0.1", "localhost"):
         print(f"WARNING: bound to {args.host} — reachable from the network. "
