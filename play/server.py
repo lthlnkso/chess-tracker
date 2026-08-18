@@ -18,6 +18,7 @@ import http.cookies
 import json
 import os
 import sys
+import threading
 import time
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
@@ -86,6 +87,15 @@ RECALL_BY_GAMES = {
 # it, "we couldn't find you" reads as a broken model rather than an
 # out-of-scope query, and the confidence percentages -- which are measured on
 # players who ARE in the gallery -- are quietly meaningless for everyone else.
+# Origins allowed to call the API from a browser. Set ALLOW_ORIGINS to a
+# comma-separated list when the page is served from somewhere else (a Railway
+# frontend calling this box as an API). Empty means same-origin only, which is
+# how it runs when server.py serves its own index.html -- and same-origin needs
+# no CORS at all, so the default stays closed.
+ALLOW_ORIGINS = [o.strip() for o in os.environ.get("ALLOW_ORIGINS", "").split(",")
+                 if o.strip()]
+
+
 GALLERY_BLURB = ("Tracking 558,735 lichess players who played 13+ bullet (1+0) "
                  "games between January and June 2026.")
 
@@ -244,7 +254,11 @@ def load(move_ckpt: str, id_ckpt: str, gallery: str):
     if gallery and os.path.isfile(gallery):
         g = np.load(gallery, allow_pickle=True)
         names = list(g["names"])
-        MODEL.update(cent=torch.from_numpy(g["centroids"].astype(np.float32)),
+        # float16, NOT float32. The .astype(np.float32) this replaces cost 286 MB
+        # resident -- a third of the whole process -- and was also SLOWER: a
+        # chunked fp16 matmul measured 53 ms against 455 ms, because it never
+        # materialises the big float32 copy. See gallery_sims().
+        MODEL.update(cent=torch.from_numpy(g["centroids"]),
                      names=names, gal_k=int(g["k"]), gal_n=len(g["pids"]),
                      # Lowercased lookup for the test-only rank probe. Built once
                      # here rather than scanned per request: at 558k names a
@@ -412,6 +426,79 @@ def load_claims():
                 cur.remove(nm)
             n += 1
     print(f"claims: replayed {n} events for {len(_CLAIMS):,} visitors", file=sys.stderr)
+
+
+# Chunk width for the gallery search. Measured end-to-end in a fresh process,
+# peak RSS of the whole serving stack: 100k -> 682 MB, 25k -> 580 MB. Smaller is
+# also slightly FASTER (21 ms vs 42 ms), so there is no tradeoff to balance here
+# -- the large chunk was simply worse on both axes. 25k keeps ~120 MB of head
+# under the 700 MB cgroup cap the deploy host runs us with.
+_SIM_CHUNK = 25_000
+
+
+def gallery_sims(q):
+    """Cosine similarity of one query against every centroid.
+
+    The bank is stored float16 to halve resident memory; CPU matmul wants
+    float32, so this casts a slice at a time. Measured faster than holding a
+    float32 bank (53 ms vs 455 ms) -- the copy was never buying speed, only
+    costing memory.
+    """
+    cent = MODEL["cent"]
+    q = q.reshape(-1).float()
+    out = torch.empty(cent.shape[0])
+    for i in range(0, cent.shape[0], _SIM_CHUNK):
+        out[i:i + _SIM_CHUNK] = cent[i:i + _SIM_CHUNK].float() @ q
+    return out
+
+
+# ---------------------------------------------------------------- rate limit
+# Every POST here costs a torch forward pass; measured throughput on the deploy
+# box is ~17 req/s. Without a limit one client with a loop denies service to
+# everyone -- and on that host "everyone" includes other people's apps sharing
+# the same 1 vCPU.
+#
+# TRUST_PROXY_IP must be set when running behind Cloudflare, because the socket
+# address is then Cloudflare's edge and every visitor would share one bucket.
+# It is OFF by default: honouring CF-Connecting-IP on a directly reachable port
+# lets anyone forge a header and get their own fresh bucket, which is worse than
+# no limit at all because it looks protected. Set it only when the port is
+# firewalled to Cloudflare's ranges.
+TRUST_PROXY_IP = os.environ.get("TRUST_PROXY_IP", "").lower() in ("1", "true", "yes")
+RATE_BURST = int(os.environ.get("RATE_BURST", "40"))      # tokens
+RATE_PER_MIN = float(os.environ.get("RATE_PER_MIN", "60"))
+_BUCKETS = {}
+_RL_LOCK = threading.Lock()
+
+
+def client_ip(handler):
+    if TRUST_PROXY_IP:
+        cf = handler.headers.get("CF-Connecting-IP")
+        if cf:
+            return cf.strip()
+        xff = handler.headers.get("X-Forwarded-For")
+        if xff:
+            return xff.split(",")[0].strip()
+    return handler.client_address[0]
+
+
+def rate_ok(ip):
+    """Token bucket per IP. Returns (allowed, retry_after_seconds)."""
+    now = time.time()
+    with _RL_LOCK:
+        tokens, last = _BUCKETS.get(ip, (float(RATE_BURST), now))
+        tokens = min(RATE_BURST, tokens + (now - last) * (RATE_PER_MIN / 60.0))
+        if tokens < 1.0:
+            _BUCKETS[ip] = (tokens, now)
+            return False, max(1, int((1.0 - tokens) / (RATE_PER_MIN / 60.0)))
+        _BUCKETS[ip] = (tokens - 1.0, now)
+        # Bounded memory: a flood of distinct source IPs must not grow this
+        # without limit. Evict the stalest entries rather than the whole map, so
+        # an attacker cannot wipe legitimate visitors' buckets on demand.
+        if len(_BUCKETS) > 20000:
+            for k, _ in sorted(_BUCKETS.items(), key=lambda kv: kv[1][1])[:5000]:
+                _BUCKETS.pop(k, None)
+        return True, 0
 
 
 _CLOCK_WARNED = set()
@@ -679,7 +766,7 @@ def identify(games: list[dict], topn: int = 10, target: str | None = None,
         # rank them ABOVE genuinely negative matches. Score those against the
         # combined centroid using the same two bundles, so both arms are a sum
         # of two cosines and remain comparable.
-        both = (qw @ MODEL["cent"].T + qb @ MODEL["cent"].T)[0]
+        both = gallery_sims(qw) + gallery_sims(qb)
         sim = torch.where(MODEL["cov"], sim, both)
         mode = "colour-fused"
         used = len(white[-slots:]) + len(black[-slots:])
@@ -697,7 +784,7 @@ def identify(games: list[dict], topn: int = 10, target: str | None = None,
             if out is None:
                 continue
             q, _ = out
-            sims.append((q @ MODEL["cent"].T)[0])
+            sims.append(gallery_sims(q))
             used += len(ch)
         if not sims:
             return None
@@ -888,8 +975,23 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def visitor_id(self):
-        """Read the visitor cookie, or mint one for this response."""
+    def visitor_id(self, req=None):
+        """Identify the visitor: request body first, then cookie, else mint one.
+
+        The body wins because the cookie does not survive a cross-origin
+        frontend. A Railway-hosted page calling this box is third-party to it,
+        and Safari and Firefox drop third-party cookies by default -- so the
+        3-claim cap, which is the only ground truth this demo collects, would
+        quietly stop working for a large share of visitors while appearing fine.
+
+        A client-supplied id is not a security boundary and is not treated as
+        one: it caps claims per browser, nothing more. Anyone who wants to claim
+        a fourth account can already clear their cookies.
+        """
+        if req:
+            vid = str(req.get("vid") or "").strip()[:64]
+            if vid:
+                return vid, False
         raw = self.headers.get("Cookie", "")
         if raw:
             jar = http.cookies.SimpleCookie()
@@ -901,11 +1003,34 @@ class Handler(BaseHTTPRequestHandler):
                 return jar[VISITOR_COOKIE].value, False
         return metrics.new_visitor_id(), True
 
+    def _cors(self):
+        """Echo the caller's origin only if it is allow-listed.
+
+        Echoed rather than "*" because credentialed requests forbid the
+        wildcard, and because an open API that runs a torch forward pass per
+        call should not be embeddable by anyone who feels like it.
+        """
+        origin = self.headers.get("Origin")
+        if origin and origin in ALLOW_ORIGINS:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+            self.send_header("Access-Control-Allow-Credentials", "true")
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self._cors()
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Max-Age", "86400")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def _send(self, code, body, ctype="application/json", set_cookie=None):
         data = body if isinstance(body, bytes) else json.dumps(body).encode()
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
+        self._cors()
         if set_cookie:
             self.send_header(
                 "Set-Cookie",
@@ -991,6 +1116,15 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(200, payload)
 
     def do_POST(self):
+        ip = client_ip(self)
+        ok, retry = rate_ok(ip)
+        if not ok:
+            self.send_response(429)
+            self._cors()
+            self.send_header("Retry-After", str(retry))
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         n = int(self.headers.get("Content-Length", 0))
         req = json.loads(self.rfile.read(n) or b"{}")
         hist = list(req.get("history", []))
@@ -1108,7 +1242,7 @@ class Handler(BaseHTTPRequestHandler):
             # A visitor telling us which account is theirs. This is the only
             # ground truth the demo can ever collect: everywhere else we are
             # guessing, here somebody states the answer.
-            vid, _ = self.visitor_id()
+            vid, _ = self.visitor_id(req)
             name = str(req.get("name") or "").strip().lower()[:64]
             claimed = bool(req.get("claimed"))
             if not name:
@@ -1158,7 +1292,7 @@ class Handler(BaseHTTPRequestHandler):
             # which is a test case no shard-derived eval can manufacture.
             # Games are written in the same shape as play/saved/*.json so the
             # existing replay tooling reads them with no conversion.
-            vid, _ = self.visitor_id()
+            vid, _ = self.visitor_id(req)
             name = str(req.get("username") or "").strip().lower()[:64]
             games = req.get("games") or []
             if not name:

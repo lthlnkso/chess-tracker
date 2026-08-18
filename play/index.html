@@ -824,6 +824,19 @@ async function refreshWho(){
 // A claim is ground truth: the visitor is telling us the answer. Everything
 // else this demo produces is a guess, so these records are worth more than any
 // amount of extra eval on shard data.
+// Stable per-browser id, sent in the body of claim/give-up. The server also
+// accepts its own cookie, but a cross-origin frontend cannot rely on one:
+// Safari and Firefox drop third-party cookies, which would silently break the
+// 3-claim cap. localStorage is same-origin to THIS page wherever it is served.
+const VID = (() => {
+  let v = localStorage.getItem("cp_vid_client");
+  if (!v) {
+    v = (crypto.randomUUID ? crypto.randomUUID()
+                           : String(Date.now()) + Math.random().toString(36).slice(2));
+    localStorage.setItem("cp_vid_client", v);
+  }
+  return v;
+})();
 const MAX_CLAIMS = 3;
 let claims = new Set(JSON.parse(localStorage.getItem("cp_claims")||"[]"));
 let lastTop = [], lastRank = null, pendingClaim = null;
@@ -831,7 +844,7 @@ const saveClaims = ()=>localStorage.setItem("cp_claims", JSON.stringify([...clai
 
 async function sendClaim(name, claimed){
   try{
-    const r = await post("/api/claim", {name, claimed, rank:lastRank,
+    const r = await post("/api/claim", {vid:VID, name, claimed, rank:lastRank,
                                         games:finished.slice(-MAX_QUERY_GAMES)});
     if(!r.ok && r.error==="limit"){
       alert(`You can claim up to ${r.max} accounts. Un-claim one first.`);
@@ -881,7 +894,7 @@ $("gsend").onclick = async ()=>{
   if(!username){ $("gmsg").textContent = "Please enter a username."; return; }
   $("gmsg").textContent = "sending…";
   try{
-    await post("/api/giveup", {username, games:finished.slice(-MAX_QUERY_GAMES),
+    await post("/api/giveup", {vid:VID, username, games:finished.slice(-MAX_QUERY_GAMES),
                                rank:lastRank, top:lastTop});
     $("gmsg").textContent = "Thank you — saved. This helps us improve.";
     setTimeout(()=>$("gmodal").classList.add("hidden"), 1400);
