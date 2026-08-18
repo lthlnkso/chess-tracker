@@ -227,6 +227,7 @@
 <script>
 // cburnett SVGs (lichess default) — see play/pieces/NOTICE.md
 let S=null, human="w", sel=null, busy=false, drag=null, lastDropAt=0;
+let gameStartedAt=null;   // wall clock; the server needs a real created_at
 // The model reads think time at every ply and leans on it hard -- with clock
 // features zeroed, top-10 identification fell from 25/25 to 4/25. So the demo
 // keeps a real 60+0 bullet clock and reports genuine per-move durations.
@@ -507,6 +508,26 @@ function render(){
 
 }
 
+// Plain GET that deliberately does NOT touch `busy`.
+//
+// post() sets busy=true for its duration, and busy gates the board
+// (canMove = !busy && ...). Polling a queued job through post() would freeze
+// the pieces for the whole wait -- seconds, or minutes behind a backlog -- so
+// the visitor could not start their next game while the previous one scored.
+async function postFree(path, body){
+  const r = await fetch(path, {method:"POST",
+    headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
+  if(!r.ok){ const e = await r.json().catch(()=>({error:r.statusText}));
+             throw new Error(e.error||"request failed"); }
+  return await r.json();
+}
+
+async function getJSON(path){
+  const r = await fetch(path);
+  if(!r.ok){ throw new Error("request failed"); }
+  return await r.json();
+}
+
 async function post(path, body){
   busy=true;
   try{
@@ -709,9 +730,19 @@ function finish(){
 
 function recordFinished(){
   if(!S || !S.over || !S.history.length) return;
-  finished.push({history:S.history, times:times.slice(), human_white:human==="w"});
+  const rec = {history:S.history, times:times.slice(), human_white:human==="w"};
+  finished.push(rec);
   finished = finished.slice(-20);
   localStorage.setItem("cp_games", JSON.stringify(finished));
+  // Tell the server the game happened. Fire and forget: the game is already
+  // over and already saved locally, so a failure here must not surface to the
+  // visitor. This is the ONLY place created_at/completed_at and the result
+  // exist -- localStorage keeps none of them.
+  post("/api/game", {vid:VID, game:Object.assign({}, rec, {
+    created_at: (gameStartedAt || Date.now())/1000,
+    completed_at: Date.now()/1000,
+    result: S.result || null, reason: S.reason || null,
+    bot_elo: botElo || null})}).catch(function(){});
   paintConfidence();
   refreshWho();
 }
@@ -784,15 +815,61 @@ function paintConfidence(){
     : "that's all we need";
 }
 
+let identifySeq = 0;
+
+// Submit to the queue and poll for the answer.
+//
+// Polling cost is paid by the ORIGIN, not the CDN: Cloudflare will not cache a
+// job whose body changes. A hundred waiting visitors at a 250 ms tick is 400
+// req/s against a box that serves ~12, so the poll would become the spike it
+// was meant to absorb. Hence: quick first checks while the answer is likely
+// imminent, then easing out.
+async function identifyQueued(payload, seq, label){
+  // postFree, not post: submitting must not gate the board either.
+  const sub = await postFree("/api/identify/async", payload);
+  if(!sub || !sub.job) throw new Error("no job");
+  let wait = 150;
+  const started = Date.now();
+  while(Date.now() - started < 120000){
+    if(seq !== identifySeq) return null;          // superseded; stop polling
+    const st = await getJSON("/api/job/" + sub.job);
+    if(st.state === "done") return st.result;
+    if(st.state === "failed") throw new Error("job failed");
+    // Tell the visitor they are queued rather than leaving a dead spinner --
+    // "12 ahead of you" reads as busy, a frozen panel reads as broken.
+    if(st.ahead > 0){
+      label.textContent = `queued — ${st.ahead} ahead of you…`;
+    }else if(st.state === "running"){
+      label.textContent = "scoring your games…";
+    }
+    await new Promise(r=>setTimeout(r, wait));
+    wait = Math.min(wait * 1.4, 1500);
+  }
+  throw new Error("timeout");
+}
+
 async function refreshWho(){
   const label=$("idlabel"), tb=document.querySelector("#who tbody");
   if(!finished.length){ label.innerHTML="play a game and we'll guess who you are";
     tb.innerHTML=""; $("giveup").classList.add("hidden"); return; }
   label.textContent="guessing from "+finished.length+" game"+(finished.length>1?"s":"")+"…";
-  let r;
   const target = ($("ptarget").value||"").trim();
-  try{ r = await post("/api/identify",{games:finished.slice(-MAX_QUERY_GAMES), target:target||null}); }
-  catch(e){ label.textContent="identification unavailable"; return; }
+  const payload = {vid:VID, games:finished.slice(-MAX_QUERY_GAMES), target:target||null};
+  // Supersede: finishing another game while one is still being scored must not
+  // let the older, weaker answer land on top of the newer one.
+  const seq = ++identifySeq;
+  let r;
+  try{
+    r = await identifyQueued(payload, seq, label);
+  }catch(e){
+    // The queue is an optimisation, not a dependency. If it is unavailable the
+    // synchronous path still works, and a visitor should never see the
+    // difference.
+    try{ r = await post("/api/identify", payload); }
+    catch(e2){ if(seq===identifySeq) label.textContent="identification unavailable"; return; }
+  }
+  if(seq !== identifySeq) return;      // a newer game already answered
+  if(!r) return;
   if(!r.top || !r.top.length){ label.textContent="no gallery loaded"; tb.innerHTML=""; return; }
   paintElo(r.elo);
   paintProbe(r.probe);
@@ -923,6 +1000,7 @@ async function newGame(){
   premove=null;
   stopClock(); paintClock();
   S = await (await fetch("/api/new")).json(); sel=null; times=[]; myClock=BASE_MS; botClock=BASE_MS;
+  gameStartedAt = Date.now();
   $("sub").textContent = `you play 1+0 bullet against a model trained to imitate `+
       `lichess players · then it guesses which lichess player YOU are`;
   render();

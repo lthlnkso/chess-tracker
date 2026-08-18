@@ -474,6 +474,8 @@ _SIM_CHUNK = 25_000
 # gallery, which is the real ceiling on a small box. The queue's job is to make
 # that ceiling visible and survivable instead of fatal.
 QUEUE_PATH = os.environ.get("QUEUE_PATH", os.path.join(HERE, "jobs.db"))
+GAMES_PATH = os.environ.get("GAMES_PATH", os.path.join(HERE, "games.db"))
+GAMES = None
 IDENTIFY_WORKERS = int(os.environ.get("IDENTIFY_WORKERS", "1"))
 # Shared secret for remote workers. Empty disables the worker endpoints
 # entirely, so a box that has not been given a token cannot be enlisted.
@@ -506,8 +508,12 @@ def _worker_loop(n):
 
 
 def start_workers():
-    global JOBS
+    global JOBS, GAMES
     from jobq import JobQueue
+    from gamedb import GameDB
+    GAMES = GameDB(GAMES_PATH)
+    print(f"games db: {GAMES_PATH} ({GAMES.stats()['games']:,} recorded)",
+          file=sys.stderr)
     JOBS = JobQueue(QUEUE_PATH)
     JOBS.reap()
     for i in range(IDENTIFY_WORKERS):
@@ -1143,6 +1149,9 @@ class Handler(BaseHTTPRequestHandler):
             if JOBS is not None:
                 qd, rn = JOBS.depth()
                 body.update(queued=qd, running=rn, workers=IDENTIFY_WORKERS)
+            if GAMES is not None:
+                try: body.update(GAMES.stats())
+                except Exception: pass
             return self._send(200 if ready else 503, body)
 
         if self.path.startswith("/api/job/"):
@@ -1372,6 +1381,22 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"ok": True})
 
             return self._send(404, {"error": "not found"})
+
+        if self.path == "/api/game":
+            # Recorded when the game ENDS, not when it is scored, so we get the
+            # timeline (created_at / completed_at) and the outcome -- neither of
+            # which survives anywhere else. Storing is best-effort: a failure
+            # here must never cost the visitor their game.
+            if GAMES is None:
+                return self._send(503, {"error": "games db not running"})
+            vid, _ = self.visitor_id(req)
+            try:
+                gid = GAMES.record(req.get("game") or {}, visitor=vid,
+                                   claims=_CLAIMS.get(vid, []))
+                return self._send(200, {"ok": True, "id": gid})
+            except Exception as e:                       # noqa: BLE001
+                print(f"game record failed: {e}", file=sys.stderr)
+                return self._send(200, {"ok": False})
 
         if self.path == "/api/identify/async":
             # Enqueue and return immediately. The sync /api/identify below is
