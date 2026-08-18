@@ -448,6 +448,57 @@ _SIM_CHUNK = 25_000
 # So this costs nothing real and converts the failure mode from "the service
 # dies" into "the request waits", which is the difference between a visitor
 # seeing a slow page and seeing a broken one.
+# ------------------------------------------------------------- async identify
+# Identify is 671 ms and climbs under load, so making the browser block on it is
+# what turns a busy server into a broken-looking one. Submitting to a queue lets
+# the page render "your top 10 is loading" and lets the backlog be a NUMBER we
+# can show rather than a timeout.
+#
+# It does not make anything faster. Measured: the queue does ~13k enqueues/s
+# while a worker completes 1.5 identifies/s, so throughput is entirely a
+# function of IDENTIFY_WORKERS -- and each worker needs ~700 MB for its own
+# gallery, which is the real ceiling on a small box. The queue's job is to make
+# that ceiling visible and survivable instead of fatal.
+QUEUE_PATH = os.environ.get("QUEUE_PATH", os.path.join(HERE, "jobs.db"))
+IDENTIFY_WORKERS = int(os.environ.get("IDENTIFY_WORKERS", "1"))
+JOBS = None
+
+
+def _worker_loop(n):
+    while True:
+        try:
+            job = JOBS.claim()
+            if job is None:
+                time.sleep(0.25)
+                continue
+            jid, payload = job
+            try:
+                with _IDENTIFY_SEM:
+                    res = identify(payload.get("games") or [],
+                                   target=payload.get("target"))
+                JOBS.finish(jid, res or {"top": [], "games_used": 0,
+                                         "gallery": MODEL.get("gal_n", 0)})
+            except Exception as e:                       # noqa: BLE001
+                print(f"worker {n}: job {jid} failed: {e}", file=sys.stderr)
+                JOBS.finish(jid, {"error": "identify failed"}, failed=True)
+        except Exception as e:                           # noqa: BLE001
+            # A queue-level failure must not kill the worker; that would strand
+            # every future visitor on a spinner with no error anywhere.
+            print(f"worker {n}: queue error: {e}", file=sys.stderr)
+            time.sleep(1.0)
+
+
+def start_workers():
+    global JOBS
+    from jobq import JobQueue
+    JOBS = JobQueue(QUEUE_PATH)
+    JOBS.reap()
+    for i in range(IDENTIFY_WORKERS):
+        threading.Thread(target=_worker_loop, args=(i,), daemon=True).start()
+    print(f"identify queue: {QUEUE_PATH}, {IDENTIFY_WORKERS} worker(s)",
+          file=sys.stderr)
+
+
 IDENTIFY_SLOTS = int(os.environ.get("IDENTIFY_SLOTS", "2"))
 _IDENTIFY_SEM = threading.Semaphore(IDENTIFY_SLOTS)
 
@@ -1066,11 +1117,26 @@ class Handler(BaseHTTPRequestHandler):
         # identifying nobody.
         if self.path in ("/healthz", "/health"):
             ready = "ident" in MODEL and "cent" in MODEL
-            return self._send(200 if ready else 503, {
-                "ok": ready,
-                "gallery": MODEL.get("gal_n", 0),
-                "id_slots": MODEL.get("id_slots"),
-            })
+            body = {"ok": ready, "gallery": MODEL.get("gal_n", 0),
+                    "id_slots": MODEL.get("id_slots")}
+            if JOBS is not None:
+                qd, rn = JOBS.depth()
+                body.update(queued=qd, running=rn, workers=IDENTIFY_WORKERS)
+            return self._send(200 if ready else 503, body)
+
+        if self.path.startswith("/api/job/"):
+            if JOBS is None:
+                return self._send(503, {"error": "queue not running"})
+            try:
+                jid = int(self.path.rsplit("/", 1)[1])
+            except ValueError:
+                return self._send(400, {"error": "bad job id"})
+            st = JOBS.get(jid)
+            if st is None:
+                return self._send(404, {"error": "no such job"})
+            if st["state"] == "queued":
+                st["ahead"] = JOBS.position(jid)
+            return self._send(200, st)
 
         if self.path in ("/", "/index.html"):
             vid, is_new = self.visitor_id()
@@ -1242,6 +1308,20 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:                       # noqa: BLE001
                 return self._send(500, {"error": str(e)})
 
+        if self.path == "/api/identify/async":
+            # Enqueue and return immediately. The sync /api/identify below is
+            # kept as-is: it is what the golden test and any script uses, and
+            # changing its contract to chase a scaling win we do not yet need
+            # would be trading a working thing for a faster one.
+            if JOBS is None:
+                return self._send(503, {"error": "queue not running"})
+            vid, _ = self.visitor_id(req)
+            jid = JOBS.submit({"games": req.get("games") or [],
+                               "target": req.get("target")}, vid=vid)
+            qd, rn = JOBS.depth()
+            return self._send(202, {"job": jid, "ahead": JOBS.position(jid),
+                                    "queued": qd, "running": rn})
+
         if self.path == "/api/identify":
             # The server is stateless, so the browser keeps the visitor's
             # finished games and posts them back -- same contract as history.
@@ -1408,6 +1488,7 @@ def main():
     load_verifier(args.verifier, args.pack)
     load_bayes(args.bayes)
     load_claims()
+    start_workers()
     if DEV:
         print("DEV MODE: save-games button exposed", file=sys.stderr)
     metrics.start()
