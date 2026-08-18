@@ -359,7 +359,7 @@ offered:
 ```json
 {"ts": …, "visitor": "…", "username": "tuxedo_cake", "n_games": 3,
  "file": "giveup_20260817-054424_tuxedo_cake.json", "rank": 2, "of": 558735,
- "in_gallery": true, "client_rank": null, "top": ["someplayer", "tuxedo_cake", …]}
+ "in_gallery": true, "client_rank": null, "top": ["someplayer", "otherplayer", …]}
 ```
 
 `rank` is likewise recomputed server-side, and it is the whole point of the
@@ -472,10 +472,10 @@ with 10 slots, so up to 30 games are fused; three games take one bundle.
 
 ```bash
 python - <<'PY'
-import json, urllib.request
-games = json.load(open("play/saved/someplayer_live3.json"))
+import json, os, urllib.request
+games = json.load(open(os.environ["GOLDEN_GAMES"]))
 def ask(gs):
-    body = json.dumps({"games": gs, "target": "someplayer"}).encode()
+    body = json.dumps({"games": gs, "target": os.environ["GOLDEN_TARGET"]}).encode()
     req = urllib.request.Request("http://localhost:8010/api/identify", data=body,
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=300) as r:
@@ -487,9 +487,13 @@ PY
 
 Must print `[79, 20, 1] MATCH`.
 
-`play/saved/someplayer_live3.json` holds the three real games from the 2026-08-17
+`play/saved/golden_3games.json` holds the three real games from the 2026-08-17
 session — 84, 59 and 54 plies; white, black, white. Ranks are out of 558,735.
-Keep that file: it is the regression suite.
+Keep that file: it is the regression suite. It is **deliberately not in
+git** — it is a real person's game history, and `play/saved/*.json` is
+gitignored for that reason. Set `GOLDEN_GAMES` to its path and
+`GOLDEN_TARGET` to the lichess username it belongs to when running the
+check; neither value belongs in a public repo.
 
 A mismatch means the identifier, the gallery, or the clock handling changed. The
 ranks are exquisitely sensitive — the same games through the *previous* stack

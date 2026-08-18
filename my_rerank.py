@@ -11,7 +11,7 @@ Reports the same three rankings, for this visitor:
   verifier rank   where the VERIFIER ALONE puts them inside the shortlist
   fused rank      where the calibrated combination puts them
 
-    python my_rerank.py --games play/saved/someplayer_10.json --name someplayer
+    python my_rerank.py --games play/saved/session_12games.json --name YOURNAME
 """
 
 from __future__ import annotations
@@ -30,8 +30,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--games", default="play/saved/someplayer_10.json")
-    ap.add_argument("--name", default="someplayer")
+    ap.add_argument("--games", default="play/saved/session_12games.json")
+    ap.add_argument("--name", required=True,
+                    help="lichess username to score against")
     ap.add_argument("--ckpt", default="ckpt/final/ctx5_ft2.pt")
     ap.add_argument("--verifier", default="ckpt/final/verifier2_sat.pt")
     ap.add_argument("--pack", default="play/verifier_pack.npz")

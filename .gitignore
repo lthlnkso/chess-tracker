@@ -34,3 +34,6 @@ play/saved/giveup_*.json
 
 # unrelated file that happens to live in this directory
 N.Y.C. Groceries Operator(s) RFP.pdf
+
+# Visitor game recordings are personal play data — keep them local.
+play/saved/*.json
