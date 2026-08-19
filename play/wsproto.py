@@ -21,7 +21,18 @@ import socket
 import struct
 import threading
 
-GUID = "258EAFA5-E914-47DA-95CA-5AB0DC85B11F"
+# RFC 6455 section 1.3. Transcribed wrong once -- the last group was written
+# 5AB0DC85B11F instead of C5AB0DC85B11 -- which produces a well-formed but
+# incorrect Sec-WebSocket-Accept. Nothing errors: the server answers 101 and
+# every compliant client hangs up, so the whole hub silently degrades to the
+# HTTP fallback. The self-test below is why this is now checked and not read.
+GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+# The RFC's own worked example. A constant nobody can verify by eye is a
+# constant that should verify itself at import.
+assert base64.b64encode(hashlib.sha1(
+    ("dGhlIHNhbXBsZSBub25jZQ==" + GUID).encode()).digest()
+    ).decode() == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", "RFC 6455 handshake GUID is wrong"
 
 OP_CONT, OP_TEXT, OP_BIN, OP_CLOSE, OP_PING, OP_PONG = 0x0, 0x1, 0x2, 0x8, 0x9, 0xA
 

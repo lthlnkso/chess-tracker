@@ -724,10 +724,13 @@ function onDown(e, name){
   if(live) live.classList.add("dragging");
   const ghost = document.createElement("img");
   ghost.id="ghost"; ghost.src=img.src; ghost.draggable=false;
-  // Match the piece it was lifted from. The board is fluid, so this is a
-  // measurement, not a constant.
-  const r = img.getBoundingClientRect();
-  ghost.style.width = r.width + "px"; ghost.style.height = r.height + "px";
+  // Measure the LIVE piece, not `img`. render() above replaced every node, so
+  // `img` is detached by now and a detached element measures 0x0 -- which sized
+  // the ghost to nothing and made the piece vanish the moment you picked it up.
+  const liveImg = live && live.querySelector("img");
+  const r = (liveImg || sq).getBoundingClientRect();
+  const side = (liveImg ? r.width : r.width * 0.9) || 52;
+  ghost.style.width = side + "px"; ghost.style.height = side + "px";
   document.body.appendChild(ghost);
   drag = {from:name, ghost};
   moveGhost(e);
