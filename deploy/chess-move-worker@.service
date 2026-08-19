@@ -10,6 +10,14 @@
 #
 # Each is bot-only, ~253 MB: a move worker never touches the identifier or the
 # gallery, and worker.py infers that from --kinds move.
+#
+# NOTE on WORKER_KINDS: do not set it to `move` on the origin just because a
+# remote identify worker exists. The Mac mini rebooted on 2026-08-19 and took
+# its three identify workers with it; the origin, told to claim moves only, let
+# identify jobs sit queued with nobody able to take them. Leave the origin on
+# `move,identify` -- moves are still claimed first inside the loop, so this
+# costs nothing while a remote worker is up and is the only thing that keeps
+# the site whole when one is not.
 [Unit]
 Description=chess-tracker move worker %i
 After=chess-id.service
