@@ -145,7 +145,16 @@ def embed_bundles(model, ds, n_slots, device, batch, workers, label=""):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
-    ap.add_argument("--shard", required=True)
+    ap.add_argument("--shard", required=True,
+                    help="shard the GALLERY centroids are built from")
+    ap.add_argument("--query-shard", default="",
+                    help="shard the QUERIES come from; defaults to --shard. Set it "
+                         "to a different time control to measure cross-control "
+                         "identification -- a visitor hands us bullet games and "
+                         "their history is blitz.")
+    ap.add_argument("--allow-contaminated", action="store_true",
+                    help="proceed when held-out status cannot be verified. Required "
+                         "rather than assumed, because the failure is silent.")
     ap.add_argument("--out", required=True)
     ap.add_argument("--ks", default="5")
     ap.add_argument("--gallery-games", type=int, default=64,
@@ -199,45 +208,85 @@ def main():
     print(f"step {ck['step']}, {n_slots} slots, {mlpg} plies/game, loss {ck.get('loss')}",
           flush=True)
 
-    meta = np.load(os.path.join(args.shard, "meta.npy"), mmap_mode="r")
-    clocks = np.memmap(os.path.join(args.shard, "clocks.u16"), dtype=np.uint16, mode="r")
-    pid = np.concatenate([np.asarray(meta["white_pid"]), np.asarray(meta["black_pid"])])
-    gid = np.concatenate([np.arange(len(meta))] * 2)
-    seat = np.concatenate([np.zeros(len(meta), np.int8), np.ones(len(meta), np.int8)])
-    ok = np.concatenate([np.asarray(clocks[np.asarray(meta["offset"], np.int64)]) != 0xFFFF] * 2)
+    q_shard = args.query_shard or args.shard
+    cross = q_shard != args.shard
 
-    need = args.min_gallery_games + max(ks)
-    order = np.argsort(pid, kind="stable")
-    pid, gid, seat, ok = pid[order], gid[order], seat[order], ok[order]
-    bnd = np.flatnonzero(np.r_[True, pid[1:] != pid[:-1], True])
-    players = []
-    for i in range(len(bnd) - 1):
-        sl = slice(bnd[i], bnd[i + 1]); m = ok[sl]
-        if m.sum() >= need:
-            players.append((int(pid[sl][0]), gid[sl][m], seat[sl][m]))
-    print(f"{len(players):,} players with >= {need} clocked games", flush=True)
+    def load_shard(path, need):
+        """-> {username: (gid array, seat array)} for players with enough games.
 
+        Keyed by NAME, not pid. Player ids are per-shard row numbers, so the same
+        person is a different integer in every shard and matching on pid across
+        two of them silently pairs strangers.
+        """
+        meta = np.load(os.path.join(path, "meta.npy"), mmap_mode="r")
+        clocks = np.memmap(os.path.join(path, "clocks.u16"), dtype=np.uint16, mode="r")
+        with open(os.path.join(path, "players.txt"), encoding="utf-8") as f:
+            names = [ln.rstrip("\n") for ln in f]
+        pid = np.concatenate([np.asarray(meta["white_pid"]), np.asarray(meta["black_pid"])])
+        gid = np.concatenate([np.arange(len(meta))] * 2)
+        seat = np.concatenate([np.zeros(len(meta), np.int8), np.ones(len(meta), np.int8)])
+        ok = np.concatenate([np.asarray(clocks[np.asarray(meta["offset"], np.int64)]) != 0xFFFF] * 2)
+        order = np.argsort(pid, kind="stable")
+        pid, gid, seat, ok = pid[order], gid[order], seat[order], ok[order]
+        bnd = np.flatnonzero(np.r_[True, pid[1:] != pid[:-1], True])
+        out = {}
+        for i in range(len(bnd) - 1):
+            sl = slice(bnd[i], bnd[i + 1]); m = ok[sl]
+            if m.sum() >= need:
+                j = int(pid[sl][0])
+                if j < len(names):
+                    out[names[j].lower()] = (gid[sl][m], seat[sl][m])
+        return out
+
+    need_gal = args.min_gallery_games + (0 if cross else max(ks))
+    gal_by_name = load_shard(args.shard, need_gal)
+    print(f"{len(gal_by_name):,} players with >= {need_gal} clocked games in "
+          f"{os.path.basename(args.shard)}", flush=True)
+    if cross:
+        qry_by_name = load_shard(q_shard, max(ks))
+        print(f"{len(qry_by_name):,} players with >= {max(ks)} clocked games in "
+              f"{os.path.basename(q_shard)}", flush=True)
+        eligible = [n for n in gal_by_name if n in qry_by_name]
+        print(f"{len(eligible):,} players present in BOTH shards", flush=True)
+    else:
+        qry_by_name = gal_by_name
+        eligible = list(gal_by_name)
+
+    # Held-out status. test_pids index the player table of the shard the model was
+    # TRAINED on, so they are only meaningful against that same shard. Applying
+    # them to a different one selects an arbitrary integer subset and prints a
+    # reassuring number that means nothing -- which is exactly what happened on
+    # 2026-08-19 and produced an inflated 94% that had to be retracted.
     tp = ck.get("test_pids")
-    if tp is None:
-        raise SystemExit("checkpoint stores no test_pids; queries would be contaminated")
-    held = set(int(x) for x in np.asarray(tp))
-    q_pool = [p for p in players if p[0] in held]
-    print(f"{len(q_pool):,} held-out players eligible as QUERIES", flush=True)
+    trained_shard = ck.get("shard") or ck.get("shards")
+    can_verify = tp is not None and trained_shard and str(trained_shard) in (args.shard, q_shard)
+    if not can_verify:
+        msg = (f"cannot verify held-out status: checkpoint's test_pids index "
+               f"{trained_shard or 'an unrecorded shard'}, queries come from {q_shard}")
+        if not args.allow_contaminated:
+            raise SystemExit(msg + "\n  pass --allow-contaminated to proceed; "
+                             "absolute recall will be an upper bound, and only "
+                             "comparisons between arms measured the same way hold")
+        print(f"WARNING: {msg}", flush=True)
+        print("WARNING: absolute recall below is an UPPER BOUND, not a measurement",
+              flush=True)
 
     rng = np.random.default_rng(args.seed)
-    n_q = min(args.query_players, len(q_pool))
-    qsel = [q_pool[i] for i in rng.choice(len(q_pool), n_q, replace=False)]
-    qset = {p[0] for p in qsel}
+    eligible.sort()
+    n_q = min(args.query_players, len(eligible))
+    qsel = [eligible[i] for i in rng.choice(len(eligible), n_q, replace=False)]
+    qset = set(qsel)
     # Distractors need not be held out -- they are only ever wrong answers, and
     # the deployed gallery is everyone. This is what lifts the ceiling from the
     # test-split size to the whole player base.
-    dpool = [p for p in players if p[0] not in qset]
+    dpool = [n for n in gal_by_name if n not in qset]
     n_d = min(args.gallery_players - n_q, len(dpool))
     dsel = [dpool[i] for i in rng.choice(len(dpool), n_d, replace=False)]
-    gal_players = qsel + dsel
+    gal_players = [(n, *gal_by_name[n]) for n in qsel + dsel]
     M = len(gal_players)
     sizes = [s for s in sizes if s <= M]
-    print(f"gallery {M:,} ({n_q:,} queries + {n_d:,} distractors)", flush=True)
+    print(f"gallery {M:,} ({n_q:,} queries + {n_d:,} distractors)"
+          + (f" | queries from {os.path.basename(q_shard)}" if cross else ""), flush=True)
 
     res = {"ckpt": args.ckpt, "gallery_built": M, "query_players": n_q,
            "gallery_games": args.gallery_games, "sizes": sizes, "pools": {}}
@@ -248,12 +297,14 @@ def main():
         # kind of object.
         gal_bundles, gal_owner = [], []
         qry_bundles, cent_sizes = [], []
-        for idx, (p, g, s) in enumerate(gal_players):
+        for idx, (nm, g, s) in enumerate(gal_players):
             perm = rng.permutation(len(g))
             # Use as many games as the player HAS, capped -- a player with 20
             # games gets a 20-game centroid, which is exactly what deployment
-            # does. Reserve k of them for the query so the two never overlap.
-            n_gal = min(args.gallery_games, len(g) - k)
+            # does. When the query comes from the SAME shard, reserve k games for
+            # it so the two never overlap; across shards there is nothing to
+            # reserve, since no game can appear on both sides.
+            n_gal = min(args.gallery_games, len(g) - (0 if cross else k))
             gal = perm[:n_gal]
             chunks = [gal[j:j + k] for j in range(0, len(gal) - k + 1, k)] or [gal[:k]]
             cent_sizes.append(len(chunks) * k)
@@ -261,8 +312,13 @@ def main():
                 gal_bundles.append([(int(g[j]), int(s[j])) for j in c])
                 gal_owner.append(idx)
             if idx < n_q:                       # queries are the first n_q entries
-                q = perm[n_gal:n_gal + k]
-                qry_bundles.append([(int(g[j]), int(s[j])) for j in q])
+                if cross:
+                    qg, qs = qry_by_name[nm]
+                    qp = rng.permutation(len(qg))[:k]
+                    qry_bundles.append([(int(qg[j]), int(qs[j])) for j in qp])
+                else:
+                    q = perm[n_gal:n_gal + k]
+                    qry_bundles.append([(int(g[j]), int(s[j])) for j in q])
 
         cs = np.asarray(cent_sizes)
         print(f"  k={k}: {len(gal_bundles):,} gallery bundles, {len(qry_bundles):,} queries "
@@ -273,7 +329,7 @@ def main():
             "min": int(cs.min()), "max": int(cs.max())}
         GE = embed_bundles(model, Bundles(args.shard, gal_bundles, mlpg, wr),
                            n_slots, device, args.batch, args.workers, f"k{k} gallery")
-        QE = embed_bundles(model, Bundles(args.shard, qry_bundles, mlpg, wr),
+        QE = embed_bundles(model, Bundles(q_shard, qry_bundles, mlpg, wr),
                            n_slots, device, args.batch, args.workers, f"k{k} query")
         owner = torch.tensor(gal_owner)
         C = torch.zeros(M, GE.shape[1])
@@ -306,7 +362,7 @@ def main():
         # so any gap is the split itself and not a different sample.
         wc, bc, owner_w, owner_b = [], [], [], []
         qw_b, qb_b, qmix_b, keep = [], [], [], []
-        for idx, (p, g, s_) in enumerate(gal_players):
+        for idx, (nm, g, s_) in enumerate(gal_players):
             perm = rng.permutation(len(g))
             w = [int(j) for j in perm if s_[j] == 0]
             b = [int(j) for j in perm if s_[j] == 1]
