@@ -1063,7 +1063,18 @@ def identify(games: list[dict], topn: int = 10, target: str | None = None,
             mt[0 if human_white else 1::2] = True     # the human's own turns
             raw = (g.get("times") or [])[:T]
             check_clock_track(raw, human_white)
-            fe = features_from_times(raw)
+            # The clock base has to come from the GAME, not a constant. This
+            # function reconstructs the remaining-time trace by subtracting each
+            # think time from `base_s`, and the "fraction of remaining" feature
+            # divides by it. Feed a 3+0 game against a 60 s base and the trace
+            # goes negative within a few moves, the divisor clamps to 1e-6, and
+            # the fraction pins to 1.0 for the rest of the game -- a constant,
+            # carrying nothing. Measured: blitz games score the same whether
+            # given their real clocks or a synthetic bullet track, because the
+            # real ones were being destroyed here. Bullet is unaffected; 60 is
+            # what the demo always sends.
+            fe = features_from_times(raw, base_s=int(g.get("tc_base") or 60),
+                                     inc_s=int(g.get("tc_inc") or 0))
             if len(fe) < T:                           # missing times -> pad, but warn
                 fe = np.vstack([fe, np.zeros((T - len(fe), N_TIME_FEATS), np.float32)])
             blocks.append((pl, fe, mt))
