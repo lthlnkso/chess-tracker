@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import queue
 import os
 import sqlite3
 import time
@@ -44,9 +45,14 @@ CREATE INDEX IF NOT EXISTS ix_created ON jobs(created);
 
 
 class JobQueue:
+    # Bounded so descriptors cannot grow with visitor count; 16 is far more
+    # concurrency than a 4-core box can use on a single-writer database.
+    POOL_MAX = 16
+
     def __init__(self, path):
         self.path = path
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        self._pool: "queue.Queue" = queue.Queue(maxsize=self.POOL_MAX)
         with self._conn() as c:
             c.executescript(SCHEMA)
             # CREATE TABLE IF NOT EXISTS silently does nothing to a table that
@@ -58,29 +64,49 @@ class JobQueue:
                 c.execute("ALTER TABLE jobs ADD COLUMN "
                           "kind TEXT NOT NULL DEFAULT 'identify'")
 
+    def _new_conn(self):
+        c = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
+        c.execute("PRAGMA journal_mode=WAL")   # readers never block the writer
+        c.execute("PRAGMA busy_timeout=30000")
+        return c
+
     @contextlib.contextmanager
     def _conn(self):
-        """Open, use, CLOSE.
+        """Borrow a connection from a bounded pool.
 
-        sqlite3.Connection is its own context manager, but `with conn:` only
-        commits or rolls back the transaction -- it never closes the handle.
-        With a connection opened per call and none of them closed, the server
-        leaked three descriptors (db, -wal, -shm) per queue operation and sat
-        at 1023 of its 1024 soft NOFILE limit while completely idle. Past that
-        every open fails with "unable to open database file", which is not a
-        load error and does not look like one: the box reads as 6% busy while
-        refusing everything. Measured on 2026-08-19 at 150 concurrent clients.
+        Opening one per call was costing 7.39 ms of the 7.95 ms the queue spent
+        on a move, measured on the production box against ~14.5 ms of model
+        compute -- so a third of a move was sqlite3.connect(), not database
+        work. Reusing the connection takes those three operations to 0.56 ms.
 
-        check_same_thread=False: the server hands connections to worker threads.
+        A pool rather than a thread-local: the server is thread-per-connection,
+        so thread-local connections would be as numerous as visitors and only
+        released whenever the GC got round to it. This caps the file
+        descriptors at POOL_MAX regardless of load, which is what the earlier
+        descriptor exhaustion was really about -- `with conn:` commits but does
+        not close, and the fix then was to close every time. The fix now is to
+        stop opening every time.
         """
-        c = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
         try:
-            c.execute("PRAGMA journal_mode=WAL")   # readers never block the writer
-            c.execute("PRAGMA busy_timeout=30000")
-            with c:                                # commit on success, roll back on raise
+            c = self._pool.get_nowait()
+        except queue.Empty:
+            c = self._new_conn()
+        try:
+            with c:                            # commit on success, roll back on raise
                 yield c
-        finally:
-            c.close()
+        except Exception:
+            # A connection that raised may be in an unknown transaction state;
+            # drop it rather than hand the next caller a poisoned one.
+            try:
+                c.close()
+            except Exception:                  # noqa: BLE001
+                pass
+            raise
+        else:
+            try:
+                self._pool.put_nowait(c)
+            except queue.Full:                 # more threads than the pool holds
+                c.close()
 
     def submit(self, payload, vid=None, kind="identify"):
         with self._conn() as c:
