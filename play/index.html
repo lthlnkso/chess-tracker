@@ -593,6 +593,129 @@ async function postFree(path, body){
   return await r.json();
 }
 
+// ---------------------------------------------------------------------------
+// Transport. One socket for the whole session; results are pushed, not polled.
+//
+// Measured on 2026-08-19 at 40 concurrent players, the two transports give the
+// same throughput (26.6 vs 26.8 moves/s) and the same latency -- and cost the
+// origin 72% of its single vCPU on polling against 14% on the socket. The
+// per-move HTTP request is the other half of it: a move is ~30 ms of compute
+// behind a connection the socket has already paid for once, at page load.
+//
+// HTTP stays as a real fallback, not one in name only. Every caller below works
+// unchanged if the socket never opens, and a drop mid-job recovers through
+// GET /api/job/<id> using the id from the queued ack -- the server persists
+// results before it pushes them, so a disconnected visitor loses nothing.
+const Hub = {
+  sock:null, ready:false, ref:0, waiting:new Map(), backoff:400, keep:null,
+
+  url(){
+    return (location.protocol === "https:" ? "wss://" : "ws://")
+           + location.host + "/ws/client";
+  },
+
+  connect(){
+    if(this.sock && (this.sock.readyState === 0 || this.sock.readyState === 1)) return;
+    let sock;
+    try{ sock = new WebSocket(this.url()); }
+    catch(e){ return this.retry(); }
+    this.sock = sock;
+
+    sock.onmessage = ev => {
+      let m; try{ m = JSON.parse(ev.data); }catch(e){ return; }
+      if(m.type === "hello"){ this.ready = true; this.backoff = 400; return; }
+      const w = this.waiting.get(m.ref);
+      if(!w) return;
+      if(m.type === "queued"){
+        w.job = m.job;                       // lets a reconnect recover it
+        if(w.onAck) { try{ w.onAck(m); }catch(e){} }
+        return;
+      }
+      this.waiting.delete(m.ref);
+      clearTimeout(w.timer);
+      if(m.type === "error" || m.failed) w.reject(new Error(m.error || "job failed"));
+      else w.resolve(m.result);
+    };
+
+    sock.onclose = () => {
+      this.ready = false;
+      clearInterval(this.keep); this.keep = null;
+      // Anything already acknowledged has a job id and a result that is being
+      // written regardless of this socket, so finish it over HTTP rather than
+      // making the visitor replay the move. Anything not yet acknowledged is
+      // rejected so the caller falls back cleanly.
+      for(const [ref, w] of [...this.waiting]){
+        this.waiting.delete(ref);
+        clearTimeout(w.timer);
+        if(w.job) pollJob(w.job).then(w.resolve, w.reject);
+        else w.reject(new Error("socket closed"));
+      }
+      this.retry();
+    };
+    sock.onerror = () => { try{ sock.close(); }catch(e){} };
+    sock.onopen  = () => {
+      // The server reads with a 120 s timeout and Cloudflare drops an idle
+      // socket at 100 s. A visitor staring at the board between games does
+      // neither, so send something harmless: the hub ignores any frame that is
+      // not a submit.
+      clearInterval(this.keep);
+      this.keep = setInterval(() => {
+        try{ sock.send(JSON.stringify({type:"ping"})); }catch(e){}
+      }, 45000);
+    };
+  },
+
+  retry(){
+    setTimeout(() => this.connect(), this.backoff);
+    this.backoff = Math.min(this.backoff * 1.8, 15000);
+  },
+
+  // Submit and resolve with the result. onAck fires on the queued frame, which
+  // for a move carries mid and bot_ms -- the board paints the human's move from
+  // it before the reply exists.
+  submit(kind, payload, onAck, timeoutMs){
+    if(!this.ready) return Promise.reject(new Error("socket not ready"));
+    const ref = String(++this.ref);
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const w = this.waiting.get(ref);
+        this.waiting.delete(ref);
+        // A timeout is not necessarily a lost job. If it was acknowledged the
+        // result is in the queue; go and get it rather than replaying work.
+        if(w && w.job) pollJob(w.job).then(resolve, reject);
+        else reject(new Error("timeout"));
+      }, timeoutMs || 45000);
+      this.waiting.set(ref, {resolve, reject, onAck, timer, job:null});
+      try{
+        this.sock.send(JSON.stringify({type:"submit", kind, ref, vid:VID, payload}));
+      }catch(e){
+        this.waiting.delete(ref); clearTimeout(timer); reject(e);
+      }
+    });
+  },
+};
+
+// Read a job to completion over HTTP. The fallback path, and the recovery path
+// when a socket drops after the job was already accepted.
+async function pollJob(job, tries, firstMs, thenMs){
+  const n = tries || 80;
+  for(let i=0; i<n; i++){
+    const st = await getJSON("/api/job/" + job);
+    if(st.state === "done") return st.result;
+    if(st.state === "failed") throw new Error("job failed");
+    await new Promise(r=>setTimeout(r, i < 4 ? (firstMs||60) : (thenMs||200)));
+  }
+  throw new Error("timeout");
+}
+
+Hub.connect();
+// Mobile suspends sockets when the tab goes to the background and does not
+// always fire close. Re-check on the way back rather than leaving a socket that
+// looks open and answers nothing.
+document.addEventListener("visibilitychange", () => {
+  if(document.visibilityState === "visible") Hub.connect();
+});
+
 // One move, queued when available.
 //
 // FETCH FIRST, then wait out whatever is left of the think time. The bot's
@@ -605,6 +728,19 @@ async function postFree(path, body){
 // bot_ms comes back on the SUBMIT, because it is sampled independently of the
 // model -- so we know how long to pause before the answer even exists.
 async function moveRequest(body, onMid){
+  // Socket first. The ack carries mid and bot_ms exactly like the HTTP submit
+  // does -- move_submit() on the server builds both -- so the board paints the
+  // human's move at the same moment either way, with one fewer connection.
+  if(Hub.ready){
+    try{
+      return await Hub.submit("move", body,
+                              ack => { if(onMid) onMid(ack.mid, ack.bot_ms); },
+                              20000);
+    }catch(e){
+      // Fall through. Not a session-wide give-up like moveQueueOk below: a
+      // socket drops for reasons that clear on their own, and Hub reconnects.
+    }
+  }
   if(moveQueueOk){
     try{
       const sub = await postFree("/api/move/async", body);
@@ -614,12 +750,7 @@ async function moveRequest(body, onMid){
         // the board can update before the reply even exists.
         if(onMid) onMid(sub.mid, sub.bot_ms);
         let out = null;
-        for(let i=0; i<80 && !out; i++){
-          const st = await getJSON("/api/job/" + sub.job);
-          if(st.state === "done"){ out = st.result; break; }
-          if(st.state === "failed") break;
-          await new Promise(r=>setTimeout(r, i < 4 ? 60 : 200));
-        }
+        try{ out = await pollJob(sub.job); }catch(e){ out = null; }
         if(out){
           // Deliberately NO wait here. The caller already paints res.mid, then
           // awaits opponentThinks(res.bot_ms) -- that IS the fetch-then-wait,
@@ -957,6 +1088,15 @@ let identifySeq = 0;
 // was meant to absorb. Hence: quick first checks while the answer is likely
 // imminent, then easing out.
 async function identifyQueued(payload, seq, label){
+  if(Hub.ready){
+    try{
+      label.textContent = "scoring your games…";
+      const r = await Hub.submit("identify", payload, null, 120000);
+      return seq === identifySeq ? r : null;      // superseded by a newer game
+    }catch(e){
+      // fall through to the polling path
+    }
+  }
   // postFree, not post: submitting must not gate the board either.
   const sub = await postFree("/api/identify/async", payload);
   if(!sub || !sub.job) throw new Error("no job");

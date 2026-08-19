@@ -33,6 +33,11 @@ CREATE TABLE IF NOT EXISTS jobs (
     finished REAL,
     vid      TEXT
 );
+-- (state, kind, id): an identify-only worker claims with a kind filter,
+-- and on a (state, id) index that means walking every queued MOVE row
+-- to find it. Moves outnumber identifies ~40:1, so the filtered claim
+-- is exactly the one that degrades under load.
+CREATE INDEX IF NOT EXISTS ix_state_kind ON jobs(state, kind, id);
 CREATE INDEX IF NOT EXISTS ix_state ON jobs(state, id);
 CREATE INDEX IF NOT EXISTS ix_created ON jobs(created);
 """

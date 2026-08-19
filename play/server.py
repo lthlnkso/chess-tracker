@@ -524,6 +524,55 @@ def ws_deliver(job_id, result, failed=False):
         return False
 
 
+def move_submit(req, hist, temp, vid):
+    """Everything a queued move needs before a worker ever sees it.
+
+    Shared by POST /api/move/async and the WebSocket hub, deliberately: these
+    are two front doors onto one queue, and the last time two move routes were
+    written separately they drifted into showing different boards. Legality,
+    game-over and the bot_ms sample are plain chess logic costing microseconds
+    and the visitor needs all three back immediately -- only the forward pass,
+    which is the reason this box saturates, belongs on a worker.
+
+    Returns one of:
+        {"error": str}                     -- illegal move, answer 400
+        {"final": state, "human_white":..} -- game already over, no model needed
+        {"payload":.., "ack":.., "human_white":..}  -- enqueue payload and the
+                                           fields the client paints right away
+    """
+    uci = req.get("uci")
+    human_white = human_is_white(len(hist), human_moving=bool(uci))
+    if uci:
+        board = chess.Board()
+        for u in hist:
+            board.push(chess.Move.from_uci(u))
+        try:
+            mv = chess.Move.from_uci(uci)
+        except ValueError:
+            return {"error": f"bad move {uci}"}
+        if mv not in board.legal_moves:
+            mv = chess.Move(mv.from_square, mv.to_square, promotion=chess.QUEEN)
+            if mv not in board.legal_moves:
+                return {"error": f"illegal move {uci}"}
+        hist.append(mv.uci())
+    board = chess.Board()
+    for u in hist:
+        board.push(chess.Move.from_uci(u))
+    if board.is_game_over():
+        # No model needed; answer now rather than round-tripping a queue to be
+        # told the game is already over.
+        return {"final": state(hist), "human_white": human_white}
+    # Sampled here and returned NOW: the client's "opponent is thinking" pause
+    # becomes the wait for the queued result, so a queued move costs the
+    # visitor nothing in perceived latency.
+    bot_ms = sample_think_ms(len(hist) - 1)
+    return {"payload": {"history": hist, "temperature": temp,
+                        "times": req.get("times"), "elo": req.get("bot_elo"),
+                        "bot_ms": bot_ms, "human_white": human_white},
+            "ack": {"bot_ms": round(bot_ms), "mid": state(hist)},
+            "human_white": human_white}
+
+
 def site_stats():
     """Numbers for /stats, all derived from what we already store.
 
@@ -1279,13 +1328,39 @@ class Handler(BaseHTTPRequestHandler):
                     continue
                 vid = str(msg.get("vid") or "")[:64] or cid
                 kind = "move" if msg.get("kind") == "move" else "identify"
-                jid = JOBS.submit(msg.get("payload") or {}, vid=vid, kind=kind)
+                ref = msg.get("ref")
+                payload = msg.get("payload") or {}
+
+                if kind == "move":
+                    # Same front door as /api/move/async, same function. The
+                    # ack carries mid and bot_ms so the board paints the human's
+                    # move before the reply exists -- without them the socket
+                    # path would feel WORSE than the HTTP one it replaces.
+                    hist = list(payload.get("history") or [])
+                    temp = float(payload.get("temperature") or 0.0)
+                    sub = move_submit(payload, hist, temp, vid)
+                    if "error" in sub:
+                        ws.send_json({"type": "error", "ref": ref,
+                                      "error": sub["error"]})
+                        continue
+                    if "final" in sub:
+                        # Game over needs no worker. Answer as a result so the
+                        # client has exactly one shape to handle.
+                        ws.send_json({"type": "result", "ref": ref, "job": None,
+                                      "failed": False, "result": sub["final"]})
+                        continue
+                    jid = JOBS.submit(sub["payload"], vid=vid, kind="move")
+                    ack = dict(sub["ack"])
+                else:
+                    jid = JOBS.submit(payload, vid=vid, kind=kind)
+                    ack = {}
+
                 with WS_LOCK:
-                    WS_JOB_OWNER[jid] = (cid, msg.get("ref"))
+                    WS_JOB_OWNER[jid] = (cid, ref)
                 # Acknowledge with the job id so a client that drops before the
                 # result arrives can fetch it over HTTP when it returns.
-                ws.send_json({"type": "queued", "ref": msg.get("ref"),
-                              "job": jid, "kind": kind})
+                ws.send_json(dict(ack, type="queued", ref=ref, job=jid,
+                                  kind=kind))
         except (WSError, OSError, ValueError):
             pass
         finally:
@@ -1517,41 +1592,14 @@ class Handler(BaseHTTPRequestHandler):
             # this box saturates, goes to a worker.
             if JOBS is None:
                 return self._send(503, {"error": "queue not running"})
-            uci = req.get("uci")
             vid, _ = self.visitor_id(req)
-            human_white = human_is_white(len(hist), human_moving=bool(uci))
-            if uci:
-                board = chess.Board()
-                for u in hist:
-                    board.push(chess.Move.from_uci(u))
-                try:
-                    mv = chess.Move.from_uci(uci)
-                except ValueError:
-                    return self._send(400, {"error": f"bad move {uci}"})
-                if mv not in board.legal_moves:
-                    mv = chess.Move(mv.from_square, mv.to_square,
-                                    promotion=chess.QUEEN)
-                    if mv not in board.legal_moves:
-                        return self._send(400, {"error": f"illegal move {uci}"})
-                hist.append(mv.uci())
-            board = chess.Board()
-            for u in hist:
-                board.push(chess.Move.from_uci(u))
-            if board.is_game_over():
-                # No model needed; answer now rather than round-tripping a queue
-                # to be told the game is already over.
-                return self._send_state(state(hist), vid, human_white)
-            # Sampled here, returned NOW: the client's "opponent is thinking"
-            # pause becomes the wait for the queued result, so a queued move
-            # costs the visitor nothing in perceived latency.
-            bot_ms = sample_think_ms(len(hist) - 1)
-            jid = JOBS.submit({"history": hist, "temperature": temp,
-                               "times": req.get("times"),
-                               "elo": req.get("bot_elo"), "bot_ms": bot_ms,
-                               "human_white": human_white},
-                              vid=vid, kind="move")
-            return self._send(202, {"job": jid, "bot_ms": round(bot_ms),
-                                    "mid": state(hist)})
+            sub = move_submit(req, hist, temp, vid)
+            if "error" in sub:
+                return self._send(400, {"error": sub["error"]})
+            if "final" in sub:
+                return self._send_state(sub["final"], vid, sub["human_white"])
+            jid = JOBS.submit(sub["payload"], vid=vid, kind="move")
+            return self._send(202, dict(sub["ack"], job=jid))
 
         if self.path == "/api/move":
             uci = req.get("uci")
