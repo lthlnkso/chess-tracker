@@ -4,7 +4,7 @@ The model does not choose moves — it scores candidate *next positions*. So a m
 is picked by generating every legal successor, encoding each one, and taking the
 model's highest-scoring (or sampling by its probabilities).
 
-Inference reuses the project's own `board_to_planes8` and `SuccessorScorer`
+Inference reuses the project's own `fastboard` encoder and `SuccessorScorer`
 rather than reimplementing the encoding in JavaScript; a subtle mismatch there
 would silently produce a weaker opponent and nothing would ever flag it.
 
@@ -36,6 +36,14 @@ from model import (MultiTaskModel, Config, N_ELO_BINS, ELO_CENTRES,  # noqa: E40
                    elo_to_bin)
 from timefeat import time_features, N_TIME_FEATS, N_TIME_BINS  # noqa: E402
 from bitboards import decode_move, board_to_planes8, N_PLANES13  # noqa: E402
+# Vectorised board -> planes. board_to_planes8 calls board.piece_map(), which
+# allocates a dict of Piece objects by calling piece_at once per occupied
+# square, then writes numpy elements one at a time. fastboard reads the
+# bitboards python-chess already holds and does one unpackbits for a whole
+# batch: 7.1x per board, and verified bit-identical to board_to_planes8 across
+# both POVs, both plane counts, and 18,526 position x move pairs covering
+# castling, en passant, promotion and captures.
+import fastboard as fb  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODEL = {}
@@ -333,14 +341,22 @@ def think(history_moves: list[str], temperature: float, times=None, elo=None):
     T = min(len(states), mlpg)
     tail = states[-T:]
 
-    planes = np.zeros((1, T, npl, 8, 8), dtype=np.uint8)
+    snaps = np.empty((T, fb.N_BB), dtype=np.uint64)
     for i, b in enumerate(tail):
-        board_to_planes8(b, pov, planes[0, i], wr)
-    cands = np.zeros((1, 1, len(legal), npl, 8, 8), dtype=np.uint8)
+        fb.snapshot(b, pov, snaps[i])
+    tail_r = (np.array([fb.rights(b, pov) for b in tail], dtype=np.int16)
+              if wr else None)
+    planes = fb.encode_batch(snaps, n_planes=npl, rights_arr=tail_r)[None]
+
+    # successor() derives each candidate's bitboards arithmetically, so the
+    # board is never pushed and popped once per legal move either.
+    csnap = np.empty((len(legal), fb.N_BB), dtype=np.uint64)
+    crights = np.empty((len(legal), 5), dtype=np.int16)
     for j, mv in enumerate(legal):
-        board.push(mv)
-        board_to_planes8(board, pov, cands[0, 0, j], wr)
-        board.pop()
+        _, rr = fb.successor(board, mv, pov, csnap[j])
+        crights[j] = rr
+    cands = fb.encode_batch(csnap, n_planes=npl,
+                            rights_arr=crights if wr else None)[None, None]
 
     # The last tail position is the mover's turn, and turns alternate backwards
     # from it -- so my_turn cannot be derived from ply parity when the tail is
@@ -929,10 +945,14 @@ def verifier_scores(q_blocks, rows, per_game=False):
             seat = int(pack["seat"][r, j])
             b = chess.Board()
             T = min(n, mlpg)
-            pl = np.zeros((T, npl, 8, 8), np.uint8)
+            gpov = chess.WHITE if seat == 0 else chess.BLACK
+            sn = np.empty((T, fb.N_BB), dtype=np.uint64)
+            rt = np.empty((T, 5), dtype=np.int16)
             okg = True
             for t in range(T):
-                board_to_planes8(b, chess.WHITE if seat == 0 else chess.BLACK, pl[t], wr)
+                fb.snapshot(b, gpov, sn[t])
+                if wr:
+                    rt[t] = fb.rights(b, gpov)
                 try:
                     b.push(decode_move(int(codes[t])))
                 except (AssertionError, ValueError):   # truncated or odd game
@@ -940,6 +960,7 @@ def verifier_scores(q_blocks, rows, per_game=False):
                     break
             if not okg:
                 continue
+            pl = fb.encode_batch(sn, n_planes=npl, rights_arr=rt if wr else None)
             fe, _, _ = time_features(np.asarray(clk[:T]), int(pack["tc_base"][r, j]),
                                      int(pack["tc_inc"][r, j]))
             mt = np.zeros(T, bool); mt[seat::2] = True
@@ -1031,9 +1052,13 @@ def identify(games: list[dict], topn: int = 10, target: str | None = None,
             T = len(pos)
             if T == 0:
                 continue
-            pl = np.zeros((T, npl, 8, 8), dtype=np.uint8)
+            sn = np.empty((T, fb.N_BB), dtype=np.uint64)
             for i, bb in enumerate(pos):
-                board_to_planes8(bb, pov, pl[i], wr)
+                fb.snapshot(bb, pov, sn[i])
+            pl = fb.encode_batch(
+                sn, n_planes=npl,
+                rights_arr=(np.array([fb.rights(x, pov) for x in pos],
+                                     dtype=np.int16) if wr else None))
             mt = np.zeros(T, dtype=bool)
             mt[0 if human_white else 1::2] = True     # the human's own turns
             raw = (g.get("times") or [])[:T]

@@ -1,0 +1,40 @@
+# One move-serving process. Enable as many as the box has spare cores:
+#
+#     systemctl enable --now chess-move-worker@1 chess-move-worker@2
+#
+# Processes, not threads, and that is the entire point. Measured on 8 real
+# cores: as threads, 2 workers give 1.30x and 8 give 0.94x -- slower than one --
+# because roughly 57% of a move is Python holding the GIL (history replay, legal
+# move generation, successor arithmetic) and only the torch forward pass lets go
+# of it. The same work in separate processes gives 1.56x at 2 and 2.34x at 8.
+#
+# Each is bot-only, ~253 MB: a move worker never touches the identifier or the
+# gallery, and worker.py infers that from --kinds move.
+[Unit]
+Description=chess-tracker move worker %i
+After=chess-id.service
+BindsTo=chess-id.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/chess-id/repo
+EnvironmentFile=/opt/chess-id/worker.env
+# Loopback, so a claim costs a millisecond rather than a trip through
+# Cloudflare -- which is why remote MOVE workers were a bad trade and local
+# ones are not. Results still post back through /api/worker/result so the
+# WebSocket hub in the main process is what pushes them to the visitor.
+Environment=DEVICE=cpu
+Environment=OMP_NUM_THREADS=1
+Environment=MKL_NUM_THREADS=1
+ExecStart=/opt/chess-id/.venv/bin/python /opt/chess-id/repo/worker.py \
+    --api http://127.0.0.1:8080 \
+    --kinds move --batch 8 \
+    --ckpt /opt/chess-id/ckpt/final/ctx5_pre.pt \
+    --idle-sleep 0.01 --max-idle-sleep 0.05
+Restart=always
+RestartSec=3
+# Bot-only measures 253 MB; the ceiling is headroom, not a target.
+MemoryMax=420M
+
+[Install]
+WantedBy=multi-user.target

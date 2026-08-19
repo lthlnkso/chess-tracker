@@ -59,10 +59,22 @@ def main():
     if not token:
         sys.exit("WORKER_TOKEN not set")
 
-    import server                                        # noqa: E402
-    server.load(args.ckpt, args.id_ckpt, args.gallery)
     kinds = [k.strip() for k in args.kinds.split(",") if k.strip()]
-    print(f"worker up: {args.api} kinds={kinds}", file=sys.stderr, flush=True)
+
+    import server                                        # noqa: E402
+    # A move worker needs neither the identifier nor the 558k gallery, and
+    # loading them anyway costs 400 MB it will never read: measured 672 MB
+    # resident for the full stack against 253 MB for the bot alone. That is the
+    # difference between fitting three move workers on a box and fitting one,
+    # so it is inferred rather than left to whoever writes the unit file.
+    id_ckpt, gallery = args.id_ckpt, args.gallery
+    if kinds == ["move"]:
+        id_ckpt, gallery = "", ""
+        print("move-only worker: skipping identifier and gallery",
+              file=sys.stderr, flush=True)
+    server.load(args.ckpt, id_ckpt, gallery)
+    print(f"worker up: {args.api} kinds={kinds} batch={args.batch}",
+          file=sys.stderr, flush=True)
 
     sleep = args.idle_sleep
     done = 0
