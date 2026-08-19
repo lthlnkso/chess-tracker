@@ -1,0 +1,33 @@
+# Local identify worker. The Mac mini is enlisted only when demand is high, so
+# the box must be able to identify on its own -- otherwise every visitor who
+# finishes a game on a quiet Tuesday waits forever for a worker that is asleep
+# in someone's house.
+#
+# Full stack, ~672 MB: unlike a move worker this one genuinely needs the
+# identifier and the 558k gallery. One process is plenty -- identify runs about
+# once per 40 moves, so its core is mostly idle and doubles as headroom.
+[Unit]
+Description=chess-tracker identify worker %i
+After=chess-id.service
+BindsTo=chess-id.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/chess-id/repo
+EnvironmentFile=/opt/chess-id/worker.env
+Environment=DEVICE=cpu
+Environment=OMP_NUM_THREADS=1
+Environment=MKL_NUM_THREADS=1
+ExecStart=/opt/chess-id/.venv/bin/python /opt/chess-id/repo/worker.py \
+    --api http://127.0.0.1:8080 \
+    --kinds identify --batch 3 \
+    --ckpt /opt/chess-id/ckpt/final/ctx5_pre.pt \
+    --id-ckpt /opt/chess-id/ckpt/final/ctx10_ft.pt \
+    --gallery /opt/chess-id/play/gallery_ctx10.npz \
+    --idle-sleep 0.02 --max-idle-sleep 0.2
+Restart=always
+RestartSec=3
+MemoryMax=1G
+
+[Install]
+WantedBy=multi-user.target

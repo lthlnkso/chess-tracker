@@ -1,0 +1,43 @@
+[Unit]
+Description=chess-tracker identifier demo (ctx10 + 558k gallery)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/chess-id/repo
+EnvironmentFile=/opt/chess-id/worker.env
+Environment=HOST=0.0.0.0
+Environment=PORT=8080
+# Cloudflare is the only thing that reaches this port, so the socket peer is
+# its edge and CF-Connecting-IP carries the real visitor. Only trustworthy
+# because ufw restricts 8080 to Cloudflare ranges.
+Environment=TRUST_PROXY_IP=1
+Environment=IDENTIFY_SLOTS=2
+Environment=RATE_BURST=100000
+Environment=RATE_PER_MIN=60000
+Environment=OMP_NUM_THREADS=1
+Environment=MKL_NUM_THREADS=1
+# ONE in-process thread, and it will take either kind. Capacity comes from the
+# separate worker processes now -- threads do not scale past ~2 because most of
+# a move is Python holding the GIL, and every extra thread here also competes
+# with the WebSocket handlers. This one exists purely so that a bug which kills
+# every external worker leaves the site slow rather than hung.
+Environment=IDENTIFY_WORKERS=1
+Environment=WORKER_KINDS=move,identify
+Environment=QUEUE_PATH=/opt/chess-id/jobs.db
+Environment=GAMES_PATH=/opt/chess-id/games.db
+ExecStart=/opt/chess-id/.venv/bin/python /opt/chess-id/repo/play/server.py \
+    --ckpt /opt/chess-id/ckpt/final/ctx5_pre.pt \
+    --id-ckpt /opt/chess-id/ckpt/final/ctx10_ft.pt \
+    --gallery /opt/chess-id/play/gallery_ctx10.npz \
+    --verifier "" --bayes ""
+Restart=on-failure
+RestartSec=5
+# The default 1024 soft limit is far too close for a box holding hundreds of
+# websockets, and a descriptor leak once hid behind it for a day.
+LimitNOFILE=65536
+# Measured VmHWM 740 MB. 8 GB box, so this is a runaway guard, not a squeeze.
+MemoryMax=1500M
+
+[Install]
+WantedBy=multi-user.target
