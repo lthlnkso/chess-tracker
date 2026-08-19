@@ -22,6 +22,7 @@ import datetime
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -36,11 +37,22 @@ BUDGET_USD = 300.0
 RESERVE_USD = 25.0
 
 
+# Enabling API access on the account reissued the token, so the original VULTR
+# value is dead and VULTR_USER is live. Try the working one first and fall back,
+# rather than making the next person rediscover that.
+KEY_NAMES = ("VULTR_USER", "VULTR")
+
+
 def key() -> str:
+    env = {}
     for line in open(os.path.join(HERE, ".env"), encoding="utf-8"):
-        if line.startswith("VULTR="):
-            return line.split("=", 1)[1].strip()
-    sys.exit("VULTR not found in .env")
+        if "=" in line and not line.lstrip().startswith("#"):
+            k, _, v = line.partition("=")
+            env[k.strip()] = v.strip()
+    for name in KEY_NAMES:
+        if env.get(name):
+            return env[name]
+    sys.exit(f"none of {KEY_NAMES} found in .env")
 
 
 def api(path, method="GET", body=None):
@@ -83,7 +95,8 @@ def spend():
     """What has been charged, and what the current fleet costs per day."""
     acct = api("/account")["account"]
     charged = float(acct["pending_charges"])
-    balance = float(acct["balance"])
+    # Vultr carries credit as a negative balance; -300 means $300 available.
+    credit = -float(acct["balance"])
     ins = api("/instances").get("instances", [])
     plans = {p["id"]: p for p in api("/plans?per_page=500").get("plans", [])}
     per_month = sum(float(plans.get(i["plan"], {}).get("monthly_cost", 0)) for i in ins)
@@ -94,7 +107,7 @@ def spend():
     days_left = (nxt - now).days + 1
 
     print(f"charged so far   ${charged:8.2f}")
-    print(f"credit balance   ${balance:8.2f}")
+    print(f"credit remaining ${credit:8.2f}")
     print(f"running          {len(ins)} instance(s), ${per_month:.2f}/mo "
           f"= ${per_day:.2f}/day")
     print(f"days left in month {days_left}")
@@ -122,6 +135,58 @@ def guard(extra_monthly: float):
                  f"${room:.0f} ceiling. Raising BUDGET_USD is a deliberate edit.")
     print("within budget.\n")
 
+
+
+# --------------------------------------------------------------------------
+def guard_hours(hourly_total: float, hours: float):
+    """Budget check for something rented by the hour, not kept.
+
+    guard() projects a monthly rate across the rest of the month, which is the
+    right question for the always-on host and the wrong one for a 20-minute
+    benchmark -- three $48/mo boxes look like $144/mo and would be refused for a
+    seven cent experiment.
+    """
+    charged, per_day, days_left = spend()
+    cost = hourly_total * hours
+    projected = charged + per_day * days_left + cost
+    room = BUDGET_USD - RESERVE_USD
+    print(f"\nephemeral: ${hourly_total:.4f}/hr x {hours:.2f} h = ${cost:.2f}"
+          f"  -> projected ${projected:.2f} of ${room:.0f}")
+    if projected > room:
+        sys.exit(f"REFUSED: projects ${projected:.2f}, over ${room:.0f}.")
+    print("within budget.\n")
+
+
+def ssh_key_id(pubkey_path):
+    """Upload this machine's public key once; reuse it after that."""
+    pub = open(os.path.expanduser(pubkey_path)).read().strip()
+    for k in api("/ssh-keys").get("ssh_keys", []):
+        if k["ssh_key"].strip().split()[:2] == pub.split()[:2]:
+            return k["id"]
+    return api("/ssh-keys", "POST",
+               {"name": "chess-tracker", "ssh_key": pub})["ssh_key"]["id"]
+
+
+def create(plan, label, region="ewr", os_id=2284, sshkey=None):
+    body = {"region": region, "plan": plan, "os_id": os_id, "label": label,
+            "hostname": label, "backups": "disabled"}
+    if sshkey:
+        body["sshkey_id"] = [sshkey]
+    return api("/instances", "POST", body)["instance"]
+
+
+def destroy(iid):
+    api(f"/instances/{iid}", "DELETE")
+
+
+def wait_active(iid, timeout=420):
+    """Poll until Vultr reports the instance running with an IP."""
+    for _ in range(timeout // 5):
+        i = api(f"/instances/{iid}")["instance"]
+        if i["status"] == "active" and i["main_ip"] not in ("", "0.0.0.0"):
+            return i
+        time.sleep(5)
+    raise RuntimeError(f"instance {iid} never became active")
 
 def plans_cmd(maxmo=None):
     """Every plan that could host this, cheapest first.
@@ -164,6 +229,18 @@ def main():
         print(", ".join(regions_for(sys.argv[2])))
     elif cmd == "guard":
         guard(float(sys.argv[2]))
+    elif cmd == "sshkey":
+        print(ssh_key_id(sys.argv[2] if len(sys.argv) > 2
+                         else "~/.ssh/id_ed25519.pub"))
+    elif cmd == "down":
+        for i in api("/instances").get("instances", []):
+            if i.get("label") == sys.argv[2]:
+                print("destroying", i["label"], i["id"])
+                destroy(i["id"])
+    elif cmd == "down-all":
+        for i in api("/instances").get("instances", []):
+            print("destroying", i.get("label"), i["id"])
+            destroy(i["id"])
     else:
         sys.exit(f"unknown command {cmd}\n{__doc__}")
 
