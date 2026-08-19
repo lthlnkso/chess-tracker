@@ -409,21 +409,66 @@ splitting it would only add CORS.
 | + `ctx10_ft.pt` (identifier) | 411 MB |
 | + gallery and name index | **829 MB** |
 
-A 1 GB instance will OOM. **2 GB is the minimum, 4 GB comfortable.** Most of the
-jump is the gallery: 558,735 x 128 float16 on disk is expanded to float32 for the
-matmul, which is 286 MB.
+A 1 GB instance will OOM. **2 GB is the minimum, 4 GB comfortable.**
+
+That table predates keeping the gallery in **float16** and searching it in
+25,000-row chunks, which saved the 286 MB the float32 expansion used to cost.
+Production now measures **VmHWM 740 MB** (`MemoryPeak` 891 MB including page
+cache) against a `MemoryMax=850M` cap — the cap is there so this service dies
+alone rather than taking the other services on the box with it.
+
+### Work queue, transport and workers
+
+Both hot paths are queued. The client submits and the answer is **pushed back**;
+nothing polls.
+
+- **Transport.** One WebSocket per session at `/ws/client`, opened at page load.
+  HTTP (`POST /api/{move,identify}/async` then `GET /api/job/<id>`) is a real
+  fallback: every client path works unchanged if the socket never opens, and a
+  socket dropped mid-job recovers through `/api/job/<id>` using the id from the
+  queued ack. Results are persisted *before* they are pushed, so a visitor who
+  closes the laptop between submit and answer loses nothing.
+- **Queue.** One SQLite table (`jobs`) with a `kind` column, not two queues.
+  Workers claim with a kind filter; `UPDATE … RETURNING` makes a batch claim
+  atomic. Indexed on `(state, kind, id)` — on a `(state, id)` index a kind
+  filter walks every queued move to find an identify, and moves outnumber
+  identifies about 40:1.
+- **Local worker** (`IDENTIFY_WORKERS`, in-process). Claims `move` first, then
+  `identify`. A move is ~30 ms and a visitor is watching the board; an identify
+  is ~190 ms and they are watching a spinner.
+- **Remote workers** (`worker.py`, `X-Worker-Token`). Dial in, need no inbound
+  port. **Give them `--kinds identify` only.** Measured 2026-08-19: adding a
+  remote move worker moved move p50 from 167 ms to 195 ms and p95 from 478 ms to
+  642 ms, because a Cloudflare round trip each way costs more than the 30 ms of
+  compute it offloads. Identify is the work worth shipping off the box.
+
+Remote workers are **round-trip bound, not compute bound**: throughput scales
+with the number of worker *processes*, not threads. An M1 Mac mini never passed
+33% of its 8 cores at 80 concurrent players. Run identify with a small batch
+(3) — at 190 ms/job a batch of 24 makes the last visitor wait 4.6 s for an
+answer that was ready in 0.2.
 
 ### Capacity, measured
 
-At 10 concurrent clients on a laptop CPU, all requests succeeded:
+Measured from **off** the origin (a load harness on the same box measures the
+harness). 1 vCPU / 2 GB droplet, moves served locally, identify on a remote
+worker:
 
-| endpoint | median | p95 |
-|---|---|---|
-| `/api/move` (once per bot move — the hot path) | 0.06 s | 0.10 s |
-| `/api/identify` (once per finished game) | 0.56 s | 0.73 s |
+| offered load | moves/s | move p50 | identify p50 | origin CPU |
+|---|---|---|---|---|
+| 2 players | 8.0 | 0.17 s | 0.71 s | — |
+| 20 players | 17.3 | 1.07 s | 0.93 s | 66% |
+| 40 players | 16.1 | 2.34 s | 1.90 s | 61% |
 
-Throughput plateaus near 17 req/s, CPU-bound. That comfortably carries 10-20
-simultaneous players and would not survive a front-page link.
+For comparison, the same box on the **old HTTP polling client**, with no remote
+worker: 11.1 moves/s, identify p50 **18.2 s**, origin CPU 77%. The socket is
+worth about 45% less origin CPU per move, and moving identify off-box is what
+takes it from 18 s to under 1.
+
+**A real 1+0 game is ~40 plies in ~90 s, so one player generates ~0.44 moves/s.**
+A ~20 moves/s ceiling is therefore **roughly 45 concurrent players** on 1 vCPU.
+Moves are the CPU-bound part and scale with vCPUs; identify scales by adding
+remote workers.
 
 ### Environment
 
@@ -457,11 +502,19 @@ the build can reach — a GitHub Release on this repo is the default
 
 ### Still missing before a public link
 
-- **No rate limiting.** At a 17 req/s ceiling one client with a loop denies
-  service to everyone. Fine for a link sent to a handful of people; not fine for
-  a subreddit.
 - **No TLS in the process.** Terminate it at the platform's proxy.
-- **No auth**, by design — it is a public demo.
+- **No auth** on the visitor paths, by design — it is a public demo. Worker
+  routes are token-gated and **fail closed**: with no `WORKER_TOKEN` set they
+  return 503 rather than accepting anonymous workers.
+- **Rate limiting exists** (`RATE_BURST`, `RATE_PER_MIN`) but production runs it
+  effectively disabled (60,000/min) because Cloudflare is in front. That is only
+  safe while port 8080 is restricted to Cloudflare ranges — if the origin is
+  ever reachable directly, these must come down.
+- **`LimitNOFILE=65536`** is required, not optional. The default 1024 is far too
+  close for a box holding hundreds of sockets, and a descriptor leak in the
+  queue hid behind it for a day: the process sat at 1023 of 1024 while idle and
+  failed every request at 150 concurrent clients while reading 6% busy. If a
+  load test collapses with the CPU near zero, count file descriptors first.
 
 ---
 
