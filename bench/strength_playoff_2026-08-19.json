@@ -1,0 +1,93 @@
+[
+ {
+  "level": 0,
+  "kind": "skill",
+  "name": "Skill 0",
+  "games": 30,
+  "score": 2.5,
+  "rate": 0.08333333333333333,
+  "w": 1,
+  "d": 3,
+  "l": 26,
+  "avg_plies": 81.2,
+  "adjudicated": 0
+ },
+ {
+  "level": 1,
+  "kind": "skill",
+  "name": "Skill 1",
+  "games": 30,
+  "score": 8.0,
+  "rate": 0.26666666666666666,
+  "w": 5,
+  "d": 6,
+  "l": 19,
+  "avg_plies": 81.8,
+  "adjudicated": 0
+ },
+ {
+  "level": 2,
+  "kind": "skill",
+  "name": "Skill 2",
+  "games": 30,
+  "score": 6.0,
+  "rate": 0.2,
+  "w": 3,
+  "d": 6,
+  "l": 21,
+  "avg_plies": 73.8,
+  "adjudicated": 0
+ },
+ {
+  "level": 3,
+  "kind": "skill",
+  "name": "Skill 3",
+  "games": 30,
+  "score": 5.0,
+  "rate": 0.16666666666666666,
+  "w": 3,
+  "d": 4,
+  "l": 23,
+  "avg_plies": 78.33333333333333,
+  "adjudicated": 0
+ },
+ {
+  "level": 1320,
+  "kind": "elo",
+  "name": "SF Elo 1320",
+  "games": 30,
+  "score": 8.5,
+  "rate": 0.2833333333333333,
+  "w": 5,
+  "d": 7,
+  "l": 18,
+  "avg_plies": 79.83333333333333,
+  "adjudicated": 0
+ },
+ {
+  "level": 1500,
+  "kind": "elo",
+  "name": "SF Elo 1500",
+  "games": 30,
+  "score": 3.5,
+  "rate": 0.11666666666666667,
+  "w": 2,
+  "d": 3,
+  "l": 25,
+  "avg_plies": 84.6,
+  "adjudicated": 0
+ },
+ {
+  "level": 1700,
+  "kind": "elo",
+  "name": "SF Elo 1700",
+  "games": 30,
+  "score": 2.0,
+  "rate": 0.06666666666666667,
+  "w": 1,
+  "d": 2,
+  "l": 27,
+  "avg_plies": 74.4,
+  "adjudicated": 0
+ }
+]

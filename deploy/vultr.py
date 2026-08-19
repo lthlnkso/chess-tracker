@@ -55,10 +55,26 @@ def api(path, method="GET", body=None):
             return json.loads(raw) if raw else {}
     except urllib.error.HTTPError as e:
         detail = e.read().decode()[:300]
+        # The two 401s mean completely different things and the message is the
+        # only way to tell them apart, so say which one it is rather than
+        # letting the caller assume the key is bad.
         if e.code == 401 and "Unauthorized IP" in detail:
             sys.exit(f"Vultr rejected this machine's IP.\n  {detail}\n"
                      "  Add it under Account -> API -> Access Control in the "
                      "Vultr portal, then retry.")
+        if e.code == 401 and "not enabled" in detail:
+            # Two different toggles, and which one applies depends on whose key
+            # this is. Neither is on the user detail page that shows
+            # "API Access: Disabled" -- that page only reports the state.
+            sys.exit(
+                "Vultr API access is switched off. This is NOT the IP "
+                "allowlist and NOT a bad key.\n  " + detail + "\n"
+                "  Account key  : Account -> API (under OTHER) -> 'Enable API'\n"
+                "                 under Personal Access Token.\n"
+                "  Org user key : Account -> Users (under OTHER) -> the Edit "
+                "User (pencil)\n                 icon on that row -> 'Enable "
+                "API' under User API Key.\n"
+                "  Needs a root account or the 'Manage Users' permission.")
         sys.exit(f"HTTP {e.code} on {method} {path}\n  {detail}")
 
 
