@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import hmac
 import http.cookies
+import contextlib
 import json
 import os
 import sqlite3
@@ -537,7 +538,9 @@ def site_stats():
     now = time.time()
     out = {"generated_at": now}
     try:
-        with sqlite3.connect(QUEUE_PATH, timeout=10) as c:
+        # closing(), not a bare `with conn:` -- sqlite3 commits on exit but
+        # never closes, and /stats is polled every 15 s by every open tab.
+        with contextlib.closing(sqlite3.connect(QUEUE_PATH, timeout=10)) as c:
             c.execute("PRAGMA busy_timeout=5000")
             since = now - 86400
             mv = c.execute("SELECT COUNT(*) FROM jobs WHERE kind='move' AND created > ?",
@@ -557,7 +560,7 @@ def site_stats():
     except Exception as e:                                  # noqa: BLE001
         out["queue_error"] = str(e)[:80]
     try:
-        with sqlite3.connect(GAMES_PATH, timeout=10) as c:
+        with contextlib.closing(sqlite3.connect(GAMES_PATH, timeout=10)) as c:
             c.execute("PRAGMA busy_timeout=5000")
             out["games_total"], out["visitors_total"] = c.execute(
                 "SELECT COUNT(*), COUNT(DISTINCT visitor) FROM games").fetchone()

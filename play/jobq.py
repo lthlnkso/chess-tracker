@@ -15,6 +15,7 @@ without any locking of our own.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sqlite3
@@ -52,13 +53,29 @@ class JobQueue:
                 c.execute("ALTER TABLE jobs ADD COLUMN "
                           "kind TEXT NOT NULL DEFAULT 'identify'")
 
+    @contextlib.contextmanager
     def _conn(self):
-        # check_same_thread=False: the server hands connections to worker
-        # threads. Each call opens its own, so there is no shared cursor.
+        """Open, use, CLOSE.
+
+        sqlite3.Connection is its own context manager, but `with conn:` only
+        commits or rolls back the transaction -- it never closes the handle.
+        With a connection opened per call and none of them closed, the server
+        leaked three descriptors (db, -wal, -shm) per queue operation and sat
+        at 1023 of its 1024 soft NOFILE limit while completely idle. Past that
+        every open fails with "unable to open database file", which is not a
+        load error and does not look like one: the box reads as 6% busy while
+        refusing everything. Measured on 2026-08-19 at 150 concurrent clients.
+
+        check_same_thread=False: the server hands connections to worker threads.
+        """
         c = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
-        c.execute("PRAGMA journal_mode=WAL")     # readers never block the writer
-        c.execute("PRAGMA busy_timeout=30000")
-        return c
+        try:
+            c.execute("PRAGMA journal_mode=WAL")   # readers never block the writer
+            c.execute("PRAGMA busy_timeout=30000")
+            with c:                                # commit on success, roll back on raise
+                yield c
+        finally:
+            c.close()
 
     def submit(self, payload, vid=None, kind="identify"):
         with self._conn() as c:

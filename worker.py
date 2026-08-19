@@ -128,8 +128,11 @@ def main():
                 print(f"result post retry {attempt+1}: {e}", file=sys.stderr, flush=True)
                 time.sleep(2 ** attempt)
 
-        done += len(results)
-        if done % 25 == 0:
+        # Report on crossing a multiple, not on landing exactly on one: with
+        # --batch 32 `done` steps 0, 32, 64 ... and never equals a multiple of
+        # 25, so a batching worker printed nothing at all and looked idle.
+        prev, done = done, done + len(results)
+        if done // 25 != prev // 25:
             print(f"worker: {done} jobs done", file=sys.stderr, flush=True)
 
 

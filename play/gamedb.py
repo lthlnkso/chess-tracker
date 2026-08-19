@@ -23,6 +23,7 @@ later, and for training we want the state as it was, not as it ended up.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sqlite3
@@ -71,11 +72,22 @@ class GameDB:
                 if name not in cols:
                     c.execute(f"ALTER TABLE games ADD COLUMN {name} {decl}")
 
+    @contextlib.contextmanager
     def _conn(self):
+        """Open, use, CLOSE -- see the same note in jobq.py.
+
+        `with conn:` commits the transaction; it does not close the handle, so
+        a per-call connection that is never closed leaks three descriptors each
+        time and eventually exhausts the process NOFILE limit.
+        """
         c = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
-        c.execute("PRAGMA journal_mode=WAL")
-        c.execute("PRAGMA busy_timeout=30000")
-        return c
+        try:
+            c.execute("PRAGMA journal_mode=WAL")
+            c.execute("PRAGMA busy_timeout=30000")
+            with c:
+                yield c
+        finally:
+            c.close()
 
     def record(self, game, visitor=None, claims=None):
         """Store one finished game. Returns its id, or None if unusable."""
