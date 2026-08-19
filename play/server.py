@@ -1599,15 +1599,23 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"jobs": out})
 
             if self.path == "/api/worker/result":
+                # Must go through ws_deliver, not JOBS.finish*: a WebSocket
+                # client is waiting to be PUSHED this result and has no poller
+                # to fall back on. Writing straight to the queue stores the
+                # answer and leaves the visitor watching a spinner forever --
+                # which is exactly what happened the first time this was tested
+                # with an HTTP worker and WebSocket clients.
                 items = req.get("results")
                 if items:
-                    JOBS.finish_many(items)
+                    for it in items:
+                        ws_deliver(int(it["job"]), it.get("result"),
+                                   failed=bool(it.get("failed")))
                     return self._send(200, {"ok": True, "n": len(items)})
                 jid = req.get("job")
                 if not jid:
                     return self._send(400, {"error": "no job"})
-                JOBS.finish(int(jid), req.get("result"),
-                            failed=bool(req.get("failed")))
+                ws_deliver(int(jid), req.get("result"),
+                           failed=bool(req.get("failed")))
                 return self._send(200, {"ok": True})
 
             return self._send(404, {"error": "not found"})

@@ -537,12 +537,15 @@ async function postFree(path, body){
 //
 // bot_ms comes back on the SUBMIT, because it is sampled independently of the
 // model -- so we know how long to pause before the answer even exists.
-async function moveRequest(body){
+async function moveRequest(body, onMid){
   if(moveQueueOk){
     try{
       const sub = await postFree("/api/move/async", body);
       if(sub && sub.fen) return sub;            // game already over; answered inline
       if(sub && sub.job){
+        // The submit already carries the position after the human's move, so
+        // the board can update before the reply even exists.
+        if(onMid) onMid(sub.mid, sub.bot_ms);
         let out = null;
         for(let i=0; i<80 && !out; i++){
           const st = await getJSON("/api/job/" + sub.job);
@@ -565,7 +568,9 @@ async function moveRequest(body){
       moveQueueOk = false;
     }
   }
-  return await post("/api/move", body);
+  const r = await post("/api/move", body);
+  if(onMid) onMid(r.mid, r.bot_ms);      // same behaviour on both routes
+  return r;
 }
 
 async function getJSON(path){
@@ -720,32 +725,32 @@ async function play(uci){
     // box that must never fall over, and the visitor pays nothing, because
     // the "opponent is thinking" pause absorbs the wait. Falls back to the
     // synchronous route if the queue is unavailable.
-    const res = await moveRequest({history:S.history,uci,temperature:0,
-                                   times:times,bot_elo:botElo,vid:VID});
-    // The reply's think time comes from the server, sampled from real 1+0 games.
-    // It used to be a hard 0, which is a value no ply in the training data ever
-    // takes -- and the identifier reads per-ply time as a feature, so half of
-    // every game was telling it something impossible.
-    // Floor the VISUAL gap so an instant reply is still a distinct move you can
-    // hear. The recorded think time stays the sampled value -- this changes what
-    // the eye and ear get, not what the identifier is told.
-    const wait = Math.max(res.bot_ms > 0 ? res.bot_ms : 0, 260);
-    let mid = before;
-    if(res.mid){
-      // Show the human's move landing, then let the opponent actually spend the
-      // time we are about to record for it. Reporting a think time for a reply
-      // that appeared instantly is the same lie in a different place.
-      S = res.mid;
+    // Paint the human's move the INSTANT the position is known, then let the
+    // opponent's think run WHILE the reply is computed. Waiting for the reply
+    // before showing your own piece move is self-inflicted lag -- behind a
+    // queue it is seconds of it, and it reads as the board being broken.
+    let mid = before, thinking = null, midPainted = false;
+    const onMid = (m, botMs) => {
+      if(midPainted || !m) return;
+      midPainted = true;
+      S = m;
       mid = pieceCount(S.fen);
-      // The two plies are now separated in time, so each gets its own sound --
+      // The two plies are separated in time, so each gets its own sound --
       // one combined click would misrepresent a tempo the player can hear.
       if(mid < before) SFX.capture(); else SFX.move();
       if(S.check && !S.over) SFX.check();
       render();
       startHiss();
-      await opponentThinks(wait);
-      stopHiss();
-    }
+      // The think is a FLOOR on how fast the bot may answer, not a queue for
+      // the network to sit in, so it starts here and overlaps the compute.
+      thinking = opponentThinks(Math.max(botMs > 0 ? botMs : 0, 260));
+    };
+    const res = await moveRequest({history:S.history,uci,temperature:0,
+                                   times:times,bot_elo:botElo,vid:VID}, onMid);
+    // Safety net: if the transport never reported a mid position, paint it from
+    // the final state so the plies stay visually distinct.
+    if(!midPainted) onMid(res.mid, res.bot_ms);
+    if(thinking){ await thinking; stopHiss(); }
     S = res;
     heard = mid;
     if(S.history.length > times.length) times.push(S.bot_ms ?? 1000);
