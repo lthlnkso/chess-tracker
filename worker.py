@@ -100,11 +100,16 @@ def main():
                     result = result or {"top": [], "games_used": 0,
                                         "gallery": server.MODEL.get("gal_n", 0)}
                 elif kind == "move":
-                    choice, ranked = server.think(
+                    # bot_reply, not think(): the client needs the full board
+                    # state back, and building it here from the same function
+                    # the synchronous path uses is what keeps the two routes
+                    # from drifting into showing different boards.
+                    result, _ = server.bot_reply(
                         list(payload.get("history") or []),
                         float(payload.get("temperature") or 0.0),
-                        payload.get("times"), payload.get("elo"))
-                    result = {"uci": choice, "ranked": ranked[:5] if ranked else []}
+                        payload.get("times"), payload.get("elo"),
+                        float(payload["bot_ms"]) if payload.get("bot_ms") is not None
+                        else 1000.0)
                 else:
                     failed, result = True, {"error": f"unknown kind {kind}"}
             except Exception as e:                        # noqa: BLE001

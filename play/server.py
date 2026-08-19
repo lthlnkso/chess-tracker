@@ -484,14 +484,33 @@ JOBS = None
 
 
 def _worker_loop(n):
+    idle = 0.0
     while True:
         try:
-            job = JOBS.claim()
+            # Moves first. A move is ~30 ms and a visitor is watching the board;
+            # an identify is ~670 ms and they are watching a spinner. Without
+            # this, one identify puts a 20x head-of-line delay in front of every
+            # move behind it.
+            job = JOBS.claim(["move"]) or JOBS.claim(["identify"])
             if job is None:
-                time.sleep(0.25)
+                # Adaptive idle. A flat 250 ms sleep was measured costing moves
+                # 0.24 s of queue wait against 0.04 s of actual compute -- the
+                # wait was six times the work. Poll hard while traffic is warm,
+                # back off when genuinely idle so an empty queue is not a
+                # busy-loop on a box shared with other services.
+                time.sleep(min(0.015 + idle, 0.25))
+                idle = min(idle + 0.01, 0.25)
                 continue
+            idle = 0.0
             jid, kind, payload = job
             try:
+                if kind == "move":
+                    st, _ = bot_reply(payload.get("history") or [],
+                                      float(payload.get("temperature") or 0.0),
+                                      payload.get("times"), payload.get("elo"),
+                                      _bot_ms_of(payload))
+                    JOBS.finish(jid, st)
+                    continue
                 with _IDENTIFY_SEM:
                     res = identify(payload.get("games") or [],
                                    target=payload.get("target"))
@@ -505,6 +524,53 @@ def _worker_loop(n):
             # every future visitor on a spinner with no error anywhere.
             print(f"worker {n}: queue error: {e}", file=sys.stderr)
             time.sleep(1.0)
+
+
+def _bot_ms_of(payload):
+    """bot_ms from a queued job, treating 0 as a value rather than as absent.
+
+    `payload.get("bot_ms") or 1000.0` looks harmless and is not: a sampled think
+    time of 0 ms is legitimate -- it is what a premove looks like -- and `or`
+    rewrites it to a full second. That silently changes the clock feature the
+    identifier reads, on exactly the plies where the visitor moved fastest.
+    """
+    v = payload.get("bot_ms")
+    return float(v) if v is not None else 1000.0
+
+
+def bot_reply(hist, temp, times, elo, bot_ms):
+    """Compute the bot's reply and the resulting state.
+
+    Split out of the /api/move handler so the queued path and the synchronous
+    path build the SAME payload from the same code. Two builders that drift
+    apart would show visitors different boards depending on which route their
+    move happened to take, and nothing would flag it.
+
+    bot_ms is passed IN rather than sampled here: it is drawn independently of
+    the model, so the submit response can hand it to the client immediately and
+    the client's existing "opponent is thinking" pause doubles as the wait for
+    this result. That is what makes queuing a move free.
+    """
+    mid = state(hist)
+    choice, ranked = think(hist, temp, times, elo)
+    if choice is None:
+        return state(hist), None
+    hist = list(hist) + [choice]
+    prev = list(times or [])
+    spent = sum(float(t or 0) for t in prev[1::2]) if prev else 0.0
+    remaining = max(0.0, BASE_MS - spent)
+    flagged = bot_ms >= remaining
+    if flagged:
+        bot_ms = remaining
+    st = state(hist, ranked, last=choice)
+    st["mid"] = mid
+    st["bot_ms"] = round(bot_ms)
+    st["bot_clock_ms"] = round(max(0.0, remaining - bot_ms))
+    if flagged and not st["over"]:
+        st["over"] = True
+        st["reason"] = "time forfeit"
+        st["result"] = "1-0" if bool(st.get("human_white", True)) else "0-1"
+    return st, choice
 
 
 def start_workers():
@@ -1241,6 +1307,50 @@ class Handler(BaseHTTPRequestHandler):
         req = json.loads(self.rfile.read(n) or b"{}")
         hist = list(req.get("history", []))
         temp = float(req.get("temperature", 0.0))
+
+        if self.path == "/api/move/async":
+            # Queued moves. The validation and game-over checks stay HERE --
+            # they are plain chess logic costing microseconds, and the visitor
+            # needs an immediate answer for an illegal move or a finished game.
+            # Only the model forward pass, which is 28 ms and the entire reason
+            # this box saturates, goes to a worker.
+            if JOBS is None:
+                return self._send(503, {"error": "queue not running"})
+            uci = req.get("uci")
+            vid, _ = self.visitor_id(req)
+            human_white = human_is_white(len(hist), human_moving=bool(uci))
+            if uci:
+                board = chess.Board()
+                for u in hist:
+                    board.push(chess.Move.from_uci(u))
+                try:
+                    mv = chess.Move.from_uci(uci)
+                except ValueError:
+                    return self._send(400, {"error": f"bad move {uci}"})
+                if mv not in board.legal_moves:
+                    mv = chess.Move(mv.from_square, mv.to_square,
+                                    promotion=chess.QUEEN)
+                    if mv not in board.legal_moves:
+                        return self._send(400, {"error": f"illegal move {uci}"})
+                hist.append(mv.uci())
+            board = chess.Board()
+            for u in hist:
+                board.push(chess.Move.from_uci(u))
+            if board.is_game_over():
+                # No model needed; answer now rather than round-tripping a queue
+                # to be told the game is already over.
+                return self._send_state(state(hist), vid, human_white)
+            # Sampled here, returned NOW: the client's "opponent is thinking"
+            # pause becomes the wait for the queued result, so a queued move
+            # costs the visitor nothing in perceived latency.
+            bot_ms = sample_think_ms(len(hist) - 1)
+            jid = JOBS.submit({"history": hist, "temperature": temp,
+                               "times": req.get("times"),
+                               "elo": req.get("bot_elo"), "bot_ms": bot_ms,
+                               "human_white": human_white},
+                              vid=vid, kind="move")
+            return self._send(202, {"job": jid, "bot_ms": round(bot_ms),
+                                    "mid": state(hist)})
 
         if self.path == "/api/move":
             uci = req.get("uci")

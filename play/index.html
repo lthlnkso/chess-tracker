@@ -227,6 +227,7 @@
 <script>
 // cburnett SVGs (lichess default) — see play/pieces/NOTICE.md
 let S=null, human="w", sel=null, busy=false, drag=null, lastDropAt=0;
+let moveQueueOk=true;    // cleared if /api/move/async ever fails
 let gameStartedAt=null;   // wall clock; the server needs a real created_at
 // The model reads think time at every ply and leans on it hard -- with clock
 // features zeroed, top-10 identification fell from 25/25 to 4/25. So the demo
@@ -525,6 +526,48 @@ async function postFree(path, body){
   return await r.json();
 }
 
+// One move, queued when available.
+//
+// FETCH FIRST, then wait out whatever is left of the think time. The bot's
+// pause is a floor on perceived latency, not something to add network time on
+// top of: doing it the other way round makes every move cost
+// think_time + round_trip, where this costs max(think_time, compute+network).
+// When the queue is idle that is identical to today; when it is busy the pause
+// we were performing anyway silently absorbs the delay.
+//
+// bot_ms comes back on the SUBMIT, because it is sampled independently of the
+// model -- so we know how long to pause before the answer even exists.
+async function moveRequest(body){
+  if(moveQueueOk){
+    try{
+      const sub = await postFree("/api/move/async", body);
+      if(sub && sub.fen) return sub;            // game already over; answered inline
+      if(sub && sub.job){
+        let out = null;
+        for(let i=0; i<80 && !out; i++){
+          const st = await getJSON("/api/job/" + sub.job);
+          if(st.state === "done"){ out = st.result; break; }
+          if(st.state === "failed") break;
+          await new Promise(r=>setTimeout(r, i < 4 ? 60 : 200));
+        }
+        if(out){
+          // Deliberately NO wait here. The caller already paints res.mid, then
+          // awaits opponentThinks(res.bot_ms) -- that IS the fetch-then-wait,
+          // and sleeping here too would make every queued move take the think
+          // time twice. The queue's latency hides inside that existing pause.
+          return out;
+        }
+      }
+      moveQueueOk = false;                      // fall through to sync below
+    }catch(e){
+      // One failure disables the queued route for the session rather than
+      // paying a doomed extra round trip on every subsequent move.
+      moveQueueOk = false;
+    }
+  }
+  return await post("/api/move", body);
+}
+
 async function getJSON(path){
   const r = await fetch(path);
   if(!r.ok){ throw new Error("request failed"); }
@@ -673,8 +716,12 @@ async function play(uci){
   const dt = commitMoveTime();
   times.push(dt);                       // the human's move
   try{
-    const res = await post("/api/move",{history:S.history,uci,temperature:0,
-                                        times:times,bot_elo:botElo});
+    // Queued when the server offers it: the model forward pass moves off the
+    // box that must never fall over, and the visitor pays nothing, because
+    // the "opponent is thinking" pause absorbs the wait. Falls back to the
+    // synchronous route if the queue is unavailable.
+    const res = await moveRequest({history:S.history,uci,temperature:0,
+                                   times:times,bot_elo:botElo,vid:VID});
     // The reply's think time comes from the server, sampled from real 1+0 games.
     // It used to be a hard 0, which is a value no ply in the training data ever
     // takes -- and the identifier reads per-ply time as a feature, so half of
