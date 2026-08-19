@@ -487,6 +487,19 @@ QUEUE_PATH = os.environ.get("QUEUE_PATH", os.path.join(HERE, "jobs.db"))
 GAMES_PATH = os.environ.get("GAMES_PATH", os.path.join(HERE, "games.db"))
 GAMES = None
 IDENTIFY_WORKERS = int(os.environ.get("IDENTIFY_WORKERS", "1"))
+# Which kinds the in-process workers take, in priority order. Default keeps the
+# old behaviour -- moves first, identify when there is nothing else -- which is
+# right for a single box with no help.
+#
+# Set WORKER_KINDS=move once a remote worker is handling identify. Measured
+# 2026-08-19: with 6 in-process threads free to take either kind, identify p95
+# hit 11.7 s at 32 players because six threads on one vCPU all grabbed 190 ms
+# identifies while 30 ms moves waited behind them. The priority order does not
+# prevent that -- it only orders each thread's own choice, and a thread that has
+# already started an identify is gone for 190 ms.
+WORKER_KINDS = [k.strip() for k in
+                os.environ.get("WORKER_KINDS", "move,identify").split(",")
+                if k.strip()]
 # Shared secret for remote workers. Empty disables the worker endpoints
 # entirely, so a box that has not been given a token cannot be enlisted.
 WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "")
@@ -633,11 +646,15 @@ def _worker_loop(n):
     idle = 0.0
     while True:
         try:
-            # Moves first. A move is ~30 ms and a visitor is watching the board;
-            # an identify is ~670 ms and they are watching a spinner. Without
-            # this, one identify puts a 20x head-of-line delay in front of every
-            # move behind it.
-            job = JOBS.claim(["move"]) or JOBS.claim(["identify"])
+            # In priority order. A move is ~30 ms and a visitor is watching the
+            # board; an identify is ~190 ms and they are watching a spinner, so
+            # moves come first -- and on a box with a remote identify worker,
+            # WORKER_KINDS=move means the origin never takes one at all.
+            job = None
+            for _k in WORKER_KINDS:
+                job = JOBS.claim([_k])
+                if job is not None:
+                    break
             if job is None:
                 # Adaptive idle. A flat 250 ms sleep was measured costing moves
                 # 0.24 s of queue wait against 0.04 s of actual compute -- the
@@ -730,8 +747,8 @@ def start_workers():
     JOBS.reap()
     for i in range(IDENTIFY_WORKERS):
         threading.Thread(target=_worker_loop, args=(i,), daemon=True).start()
-    print(f"identify queue: {QUEUE_PATH}, {IDENTIFY_WORKERS} worker(s)",
-          file=sys.stderr)
+    print(f"queue: {QUEUE_PATH}, {IDENTIFY_WORKERS} worker(s), "
+          f"kinds={','.join(WORKER_KINDS)}", file=sys.stderr)
 
 
 IDENTIFY_SLOTS = int(os.environ.get("IDENTIFY_SLOTS", "2"))
