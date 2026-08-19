@@ -483,6 +483,37 @@ WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "")
 JOBS = None
 
 
+# ---------------------------------------------------------------- ws hub
+# Clients and workers hold one socket each and results are PUSHED, replacing a
+# measured 23 polls per move. The server relays: with WebSockets a worker cannot
+# address a browser directly (that needs WebRTC, whose NAT traversal and TURN
+# relay cost far more than the 0.04 ms this relay costs).
+#
+# Durability first: every result is written to the job queue BEFORE it is
+# pushed. A client that closed its laptop mid-game loses nothing -- the job
+# completes, the row persists, and GET /api/job/<id> still serves it when they
+# come back. Dropping the socket must never drop the work.
+WS_CLIENTS = {}          # conn_id -> WebSocket
+WS_JOB_OWNER = {}        # job_id  -> (conn_id, ref)
+WS_LOCK = threading.Lock()
+
+
+def ws_deliver(job_id, result, failed=False):
+    """Persist, then push to the owning client if it is still connected."""
+    JOBS.finish(job_id, result, failed=failed)
+    with WS_LOCK:
+        owner = WS_JOB_OWNER.pop(job_id, None)
+        ws = WS_CLIENTS.get(owner[0]) if owner else None
+    if not ws:
+        return False                      # client gone; result is stored anyway
+    try:
+        ws.send_json({"type": "result", "ref": owner[1], "job": job_id,
+                      "failed": failed, "result": result})
+        return True
+    except Exception:                                       # noqa: BLE001
+        return False
+
+
 def _worker_loop(n):
     idle = 0.0
     while True:
@@ -509,16 +540,16 @@ def _worker_loop(n):
                                       float(payload.get("temperature") or 0.0),
                                       payload.get("times"), payload.get("elo"),
                                       _bot_ms_of(payload))
-                    JOBS.finish(jid, st)
+                    ws_deliver(jid, st)
                     continue
                 with _IDENTIFY_SEM:
                     res = identify(payload.get("games") or [],
                                    target=payload.get("target"))
-                JOBS.finish(jid, res or {"top": [], "games_used": 0,
-                                         "gallery": MODEL.get("gal_n", 0)})
+                ws_deliver(jid, res or {"top": [], "games_used": 0,
+                                          "gallery": MODEL.get("gal_n", 0)})
             except Exception as e:                       # noqa: BLE001
                 print(f"worker {n}: job {jid} failed: {e}", file=sys.stderr)
-                JOBS.finish(jid, {"error": "identify failed"}, failed=True)
+                ws_deliver(jid, {"error": "identify failed"}, failed=True)
         except Exception as e:                           # noqa: BLE001
             # A queue-level failure must not kill the worker; that would strand
             # every future visitor on a spinner with no error anywhere.
@@ -1163,6 +1194,86 @@ class Handler(BaseHTTPRequestHandler):
                 return jar[VISITOR_COOKIE].value, False
         return metrics.new_visitor_id(), True
 
+    def _ws_client(self, ws, WSError):
+        """A browser. Submits work, receives pushed results."""
+        cid = os.urandom(8).hex()
+        with WS_LOCK:
+            WS_CLIENTS[cid] = ws
+        try:
+            ws.send_json({"type": "hello", "conn": cid})
+            while True:
+                msg = ws.recv_json(timeout=120)
+                if msg is None:                     # ping/pong
+                    continue
+                if msg.get("type") != "submit":
+                    continue
+                if JOBS is None:
+                    ws.send_json({"type": "error", "ref": msg.get("ref"),
+                                  "error": "queue not running"})
+                    continue
+                vid = str(msg.get("vid") or "")[:64] or cid
+                kind = "move" if msg.get("kind") == "move" else "identify"
+                jid = JOBS.submit(msg.get("payload") or {}, vid=vid, kind=kind)
+                with WS_LOCK:
+                    WS_JOB_OWNER[jid] = (cid, msg.get("ref"))
+                # Acknowledge with the job id so a client that drops before the
+                # result arrives can fetch it over HTTP when it returns.
+                ws.send_json({"type": "queued", "ref": msg.get("ref"),
+                              "job": jid, "kind": kind})
+        except (WSError, OSError, ValueError):
+            pass
+        finally:
+            with WS_LOCK:
+                WS_CLIENTS.pop(cid, None)
+                # Leave WS_JOB_OWNER entries alone: the jobs are still running
+                # and their results still belong in the queue. ws_deliver will
+                # simply find no socket and stop there.
+            ws.close()
+
+    def _ws_worker(self, ws, WSError):
+        """A worker. Pulls batches, returns results, holds one socket."""
+        if not WORKER_TOKEN:
+            ws.close(1008)
+            return
+        try:
+            first = ws.recv_json(timeout=20)
+            if not first or not hmac.compare_digest(
+                    str(first.get("token") or ""), WORKER_TOKEN):
+                ws.send_json({"type": "error", "error": "bad token"})
+                ws.close(1008)
+                return
+            kinds = first.get("kinds") or ["move", "identify"]
+            batch = max(1, min(int(first.get("max") or 8), 64))
+            ws.send_json({"type": "ready"})
+            idle = 0.0
+            while True:
+                # Moves before identifies, same reasoning as the local worker:
+                # 30 ms of work must not sit behind 670 ms.
+                jobs = ([] if "move" not in kinds else JOBS.claim_batch(batch, ["move"]))
+                if not jobs and "identify" in kinds:
+                    jobs = JOBS.claim_batch(batch, ["identify"])
+                if not jobs:
+                    time.sleep(min(0.015 + idle, 0.25))
+                    idle = min(idle + 0.01, 0.25)
+                    # A silent socket is indistinguishable from a dead one, so
+                    # prove liveness while idle rather than discovering the
+                    # worker vanished only when work arrives for it.
+                    if idle >= 0.25:
+                        ws.ping()
+                    continue
+                idle = 0.0
+                ws.send_json({"type": "jobs",
+                              "jobs": [{"job": j, "kind": k, "payload": p}
+                                       for j, k, p in jobs]})
+                res = ws.recv_json(timeout=300)
+                for item in (res or {}).get("results") or []:
+                    ws_deliver(int(item["job"]), item.get("result"),
+                               failed=bool(item.get("failed")))
+        except (WSError, OSError, ValueError, KeyError):
+            pass
+        finally:
+            ws.close()
+
     def _cors(self):
         """Echo the caller's origin only if it is allow-listed.
 
@@ -1208,6 +1319,15 @@ class Handler(BaseHTTPRequestHandler):
         # model and gallery are loaded, which is the thing that can actually be
         # wrong -- a process that booted without them serves 200s forever while
         # identifying nobody.
+        if self.path in ("/ws/client", "/ws/worker"):
+            from wsproto import upgrade, WSError
+            ws = upgrade(self)
+            if ws is None:
+                return self._send(400, {"error": "expected websocket upgrade"})
+            if self.path == "/ws/worker":
+                return self._ws_worker(ws, WSError)
+            return self._ws_client(ws, WSError)
+
         if self.path in ("/healthz", "/health"):
             ready = "ident" in MODEL and "cent" in MODEL
             body = {"ok": ready, "gallery": MODEL.get("gal_n", 0),
