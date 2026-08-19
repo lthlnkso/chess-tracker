@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Who are you? — stats</title>
+<style>
+  :root{ --bg:#fcfcfb; --ink:#0b0b0b; --muted:#52514e; --line:#e3e2df; --panel:#fff;
+         --accent:#2a78d6; --good:#5aa860; }
+  @media (prefers-color-scheme: dark){
+    :root{ --bg:#1a1a19; --ink:#fff; --muted:#c3c2b7; --line:#333331; --panel:#232322;
+           --accent:#3987e5; --good:#6bbd72; }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+  .wrap{max-width:860px;margin:0 auto;padding:32px 20px 60px}
+  h1{font-size:22px;margin:0 0 4px}
+  .sub{color:var(--muted);font-size:13.5px;margin-bottom:26px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px 18px}
+  .n{font-size:34px;font-weight:700;font-variant-numeric:tabular-nums;line-height:1.15}
+  .k{font-size:12px;letter-spacing:.07em;text-transform:uppercase;color:var(--muted);margin-top:6px}
+  .sm{font-size:12.5px;color:var(--muted);margin-top:4px}
+  .live{display:inline-block;width:8px;height:8px;border-radius:50%;
+        background:var(--good);margin-right:6px;vertical-align:middle}
+  .foot{margin-top:26px;font-size:12.5px;color:var(--muted);line-height:1.6}
+  a{color:var(--accent)}
+  /* auto-fit with a 180px floor collapses to ONE column at 375px, which turns
+     six numbers into six full-screen cards. Below that width the count is
+     pinned to two -- a stat card does not need 335px to show "0.33". */
+  @media (max-width:520px){
+    .wrap{padding:26px 14px 48px}
+    h1{font-size:20px}
+    .sub{margin-bottom:18px}
+    .grid{grid-template-columns:repeat(2,1fr);gap:10px}
+    .card{padding:13px 12px}
+    .n{font-size:26px}
+    .k{font-size:11px;letter-spacing:.06em}
+    .sm{font-size:11.5px}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Who are you? — stats</h1>
+  <div class="sub"><span class="live"></span><span id="upd">loading…</span></div>
+
+  <div class="grid">
+    <div class="card"><div class="n" id="mpm">–</div><div class="k">moves / minute</div>
+      <div class="sm">last 24 hours</div></div>
+    <div class="card"><div class="n" id="prog">–</div><div class="k">games in progress</div>
+      <div class="sm">a move in the last 3 min</div></div>
+    <div class="card"><div class="n" id="vis">–</div><div class="k">unique visitors</div>
+      <div class="sm" id="vis24">–</div></div>
+    <div class="card"><div class="n" id="claims">–</div><div class="k">“it’s me” claims</div>
+      <div class="sm" id="claimers">–</div></div>
+    <div class="card"><div class="n" id="games">–</div><div class="k">games played</div>
+      <div class="sm" id="games24">–</div></div>
+    <div class="card"><div class="n" id="wl">–</div><div class="k">human W / L</div>
+      <div class="sm">against the bot</div></div>
+  </div>
+
+  <div class="foot">
+    Searching <b id="gal">–</b> lichess players who played 13+ bullet (1+0) games
+    between January and June 2026. &nbsp;·&nbsp; <a href="/">play</a>
+  </div>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+const fmt = n => (n === null || n === undefined) ? "–" : n.toLocaleString();
+async function tick(){
+  try{
+    const r = await fetch("/api/stats", {cache:"no-store"});
+    const d = await r.json();
+    $("mpm").textContent    = d.moves_per_min ?? "–";
+    $("prog").textContent   = fmt(d.in_progress);
+    $("vis").textContent    = fmt(d.visitors_total);
+    $("vis24").textContent  = fmt(d.visitors_24h) + " in the last 24h";
+    $("claims").textContent = fmt(d.claims);
+    $("claimers").textContent = fmt(d.claimers) + " people";
+    $("games").textContent  = fmt(d.games_total);
+    $("games24").textContent= fmt(d.games_24h) + " in the last 24h";
+    $("wl").textContent     = fmt(d.human_won) + " / " + fmt(d.human_lost);
+    $("gal").textContent    = fmt(d.gallery);
+    $("upd").textContent    = "updated " + new Date().toLocaleTimeString();
+  }catch(e){ $("upd").textContent = "stats unavailable"; }
+}
+tick();
+// 15s, not 1s: this page must never be the thing that loads the box it reports on.
+setInterval(tick, 15000);
+</script>
+</body>
+</html>

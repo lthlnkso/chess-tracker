@@ -8,12 +8,12 @@
   :root{
     --bg:#fcfcfb; --ink:#0b0b0b; --muted:#52514e; --line:#e3e2df;
     --light:#f0d9b5; --dark:#b58863; --sel:#f0d264; --hint:#2a78d6; --last:#cfe2c4;
-    --panel:#ffffff;
+    --panel:#ffffff; --warn:#a8690a;
   }
   @media (prefers-color-scheme: dark){
     :root{ --bg:#1a1a19; --ink:#fff; --muted:#c3c2b7; --line:#333331;
            --light:#c9ad8b; --dark:#8a6f52; --sel:#8a7326; --hint:#3987e5;
-           --last:#3c5238; --panel:#232322; }
+           --last:#3c5238; --panel:#232322; --warn:#e0a32e; }
   }
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--ink);
@@ -22,11 +22,12 @@
   h1{font-size:22px;margin:0 0 4px}
   .sub{color:var(--muted);font-size:13.5px;margin-bottom:22px}
   .cols{display:flex;gap:26px;flex-wrap:wrap;align-items:flex-start}
-  .boardwrap{flex:0 0 auto}
-  #board{display:grid;grid-template-columns:repeat(8,58px);
-         grid-template-rows:repeat(8,58px);border:1px solid var(--line);
+  .boardwrap{flex:0 1 466px;max-width:466px;min-width:0}
+  #board{display:grid;grid-template-columns:repeat(8,1fr);
+         grid-template-rows:repeat(8,1fr);width:100%;aspect-ratio:1;
+         max-width:466px;border:1px solid var(--line);
          border-radius:6px;overflow:hidden;user-select:none;touch-action:none}
-  .sq{display:flex;align-items:center;justify-content:center;font-size:40px;
+  .sq{display:flex;align-items:center;justify-content:center;
       line-height:1;cursor:pointer;position:relative}
   .sq.l{background:var(--light)} .sq.d{background:var(--dark)}
   .sq.sel{box-shadow:inset 0 0 0 4px var(--sel)}
@@ -45,13 +46,13 @@
       background:radial-gradient(ellipse at center,
         rgba(255,0,0,.95) 0%, rgba(231,0,0,.75) 26%,
         rgba(169,0,0,.25) 62%, rgba(169,0,0,0) 90%)}
-  .sq .dot{position:absolute;width:16px;height:16px;border-radius:50%;
+  .sq .dot{position:absolute;width:28%;height:28%;border-radius:50%;
            background:var(--hint);opacity:.55}
   .sq .ring{position:absolute;inset:4px;border:4px solid var(--hint);
             border-radius:50%;opacity:.55}
-  .piece{width:52px;height:52px;display:block;pointer-events:none;
+  .piece{width:90%;height:90%;display:block;pointer-events:none;
          filter:drop-shadow(0 1px 1.5px rgba(0,0,0,.30))}
-  #ghost{position:fixed;z-index:50;pointer-events:none;width:52px;height:52px;
+  #ghost{position:fixed;z-index:50;pointer-events:none;
          filter:drop-shadow(0 3px 6px rgba(0,0,0,.45))}
   .panel{flex:1 1 300px;min-width:280px}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;
@@ -129,6 +130,67 @@
   .probe input{font:inherit;padding:6px 9px;border:1px solid var(--line);
                border-radius:6px;background:var(--bg);color:var(--ink)}
   .prank{font-variant-numeric:tabular-nums}
+  /* The commonest bad experience here is not a wrong guess -- it is a visitor
+     who was never in the gallery to begin with, for whom every list is ten
+     strangers and the demo simply looks broken. Saying who we can find, up
+     front and next to the board, is the difference between "this doesn't work"
+     and "I'm not in it". It sits under the board because that space is empty
+     on a wide screen and reads before the results on a narrow one. */
+  .notice{margin-top:14px;max-width:466px;background:var(--panel);border:1px solid var(--line);
+          border-left:3px solid var(--warn);border-radius:8px;
+          padding:12px 14px;font-size:12.5px;line-height:1.5;color:var(--muted)}
+  .notice .nt{font-size:11px;letter-spacing:.09em;text-transform:uppercase;
+              font-weight:600;color:var(--warn);margin-bottom:6px}
+  .notice p{margin:0 0 7px}
+  .notice p:last-child{margin-bottom:0}
+  .notice b{color:var(--ink);font-weight:600}
+
+  /* ---- narrow screens ---------------------------------------------------
+     --sq already keeps the board in bounds, so this is only the surrounding
+     chrome: tighter gutters, controls big enough to hit with a thumb, and
+     16px inputs (below that iOS zooms the whole page on focus and never
+     zooms back out). */
+  @media (max-width:820px){
+    .wrap{padding:20px 14px 48px}
+    #sound{top:18px;right:14px}
+    /* The stacked column is centred, so the heading has to be too or the page
+       reads as two different layouts stacked on top of each other. */
+    h1,.sub{max-width:466px;margin-left:auto;margin-right:auto}
+    h1{font-size:21px}
+    .sub{font-size:12.5px;margin-bottom:14px}
+    /* This is a 1+0 game. Stacked in source order the clock lands below a
+       347px board and is off screen for the whole game, which on a bullet
+       clock is not a cosmetic problem. display:contents dissolves the two
+       columns so every card becomes a direct flex child and `order` can lift
+       the clock above the board -- no duplicated markup, no second board. */
+    /* .cols is align-items:flex-start for the desktop row; in a column that
+       is the cross axis and every card shrinks to its own text width. */
+    /* Capped at the board's own width and centred, so every card lines up with
+       the board instead of a 466px board sitting beside a 740px results card. */
+    .cols{display:flex;flex-direction:column;align-items:stretch;gap:14px;
+          max-width:466px;margin:0 auto}
+    .boardwrap,.panel{display:contents}
+    #errcard{order:0}
+    #clockcard{order:1;margin:0}
+    #board{order:2}
+    .notice{order:3;margin-top:0}
+    #idcard{order:4;margin:0}
+    .probe{order:5;margin:0}
+    input{font-size:16px}
+    .card{padding:13px 14px}
+    button{padding:10px 18px}
+    .modalbox{padding:22px;max-width:calc(100vw - 32px)}
+    .mtitle{font-size:21px}
+    td.act{width:84px}
+    button.mine{font-size:12px;padding:7px 10px}
+    table{font-size:15px}
+    td{padding:6px 0}
+  }
+  /* Without a mouse the .55 resting opacity never lifts, because :hover never
+     fires -- every claim button would sit permanently half-faded. */
+  @media (hover:none){
+    button.mine{opacity:1}
+  }
 </style>
 </head>
 <body>
@@ -140,11 +202,17 @@
   <div class="cols">
     <div class="boardwrap">
       <div id="board"></div>
+      <div class="notice">
+        <div class="nt">who we can find</div>
+        <p id="blurb">{{BLURB}}</p>
+        <p>If your account is not in that set, <b>we cannot find you</b> &mdash;
+          the names will be strangers no matter how well you play.</p>
+      </div>
     </div>
 
     <div class="panel">
       <div class="card err hidden" id="errcard"><div id="status"></div></div>
-      <div class="card">
+      <div class="card" id="clockcard">
         <div class="row" style="justify-content:space-between;align-items:center;margin:0 0 8px">
           <div class="muted">opponent</div>
           <div id="botclock" style="font-variant-numeric:tabular-nums;font-size:17px;color:var(--muted)">1:00.0</div>
@@ -154,7 +222,7 @@
           <div id="clock" style="font-variant-numeric:tabular-nums;font-size:22px">1:00.0</div>
         </div>
       </div>
-      <div class="card">
+      <div class="card" id="idcard">
         <div class="muted" style="margin-bottom:8px" id="idlabel">
           play a game and we'll guess who you are</div>
         <table id="who"><tbody></tbody></table>
@@ -164,7 +232,6 @@
             <button id="clear" class="small">Clear</button>
           </div>
           <div class="muted" id="conf2">we usually know you by 5</div>
-          <div class="muted" id="blurb" style="margin-top:8px;font-size:11.5px;line-height:1.45"></div>
           <button id="giveup" class="small hidden">None of these are me →</button>
           <div id="devbar" class="hidden">
             <span class="tag">dev</span>
@@ -657,6 +724,10 @@ function onDown(e, name){
   if(live) live.classList.add("dragging");
   const ghost = document.createElement("img");
   ghost.id="ghost"; ghost.src=img.src; ghost.draggable=false;
+  // Match the piece it was lifted from. The board is fluid, so this is a
+  // measurement, not a constant.
+  const r = img.getBoundingClientRect();
+  ghost.style.width = r.width + "px"; ghost.style.height = r.height + "px";
   document.body.appendChild(ghost);
   drag = {from:name, ghost};
   moveGhost(e);
@@ -669,8 +740,11 @@ function onDown(e, name){
 
 function moveGhost(e){
   if(!drag) return;
-  drag.ghost.style.left = (e.clientX - 26) + "px";
-  drag.ghost.style.top  = (e.clientY - 26) + "px";
+  // Measured, not hardcoded: the piece is sized off --sq, which shrinks on a
+  // narrow screen, and a fixed 26px offset would hang it off the fingertip.
+  const half = (drag.ghost.offsetWidth || 52) / 2;
+  drag.ghost.style.left = (e.clientX - half) + "px";
+  drag.ghost.style.top  = (e.clientY - half) + "px";
 }
 
 // A right-click (or the browser stealing the pointer) means pointerup never

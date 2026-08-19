@@ -18,6 +18,7 @@ import hmac
 import http.cookies
 import json
 import os
+import sqlite3
 import sys
 import threading
 import time
@@ -110,8 +111,16 @@ ALLOW_ORIGINS = [o.strip() for o in os.environ.get("ALLOW_ORIGINS", "").split(",
                  if o.strip()]
 
 
-GALLERY_BLURB = ("Tracking 558,735 lichess players who played 13+ bullet (1+0) "
-                 "games between January and June 2026.")
+# Reads as the first line of the notice beside the board, so it states the
+# membership rule rather than a bare count -- the visitor needs to know
+# whether they are in the set, not how big it is.
+GALLERY_BLURB = ("We only search the 558,735 lichess accounts that played 13 or "
+                 "more 1+0 bullet games between January and June 2026.")
+
+
+def html_escape(t: str) -> str:
+    """Minimal escape for text substituted into index.html."""
+    return (t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
 def recall_for(n: int):
@@ -512,6 +521,60 @@ def ws_deliver(job_id, result, failed=False):
         return True
     except Exception:                                       # noqa: BLE001
         return False
+
+
+def site_stats():
+    """Numbers for /stats, all derived from what we already store.
+
+    Deliberately no new counters: a second source of truth for "how many games"
+    would drift from the games table and nobody would know which was right.
+
+    "In progress" is inferred rather than tracked, because a game is only
+    recorded when it ENDS. A visitor with a move in the last three minutes is
+    mid-game -- a 1+0 bullet game runs ~90 s, so three minutes covers one in
+    play without counting someone who wandered off.
+    """
+    now = time.time()
+    out = {"generated_at": now}
+    try:
+        with sqlite3.connect(QUEUE_PATH, timeout=10) as c:
+            c.execute("PRAGMA busy_timeout=5000")
+            since = now - 86400
+            mv = c.execute("SELECT COUNT(*) FROM jobs WHERE kind='move' AND created > ?",
+                           (since,)).fetchone()[0]
+            first = c.execute("SELECT MIN(created) FROM jobs WHERE created > ?",
+                              (since,)).fetchone()[0]
+            # Divide by the window we actually have data for, not a flat 1440.
+            # jobs are reaped at 24 h, so early on the table covers minutes and
+            # a fixed denominator would understate the rate by orders of
+            # magnitude.
+            mins = max((now - first) / 60.0, 1.0) if first else 1.0
+            out["moves_24h"] = mv
+            out["moves_per_min"] = round(mv / mins, 2)
+            out["in_progress"] = c.execute(
+                "SELECT COUNT(DISTINCT vid) FROM jobs "
+                "WHERE kind='move' AND created > ?", (now - 180,)).fetchone()[0]
+    except Exception as e:                                  # noqa: BLE001
+        out["queue_error"] = str(e)[:80]
+    try:
+        with sqlite3.connect(GAMES_PATH, timeout=10) as c:
+            c.execute("PRAGMA busy_timeout=5000")
+            out["games_total"], out["visitors_total"] = c.execute(
+                "SELECT COUNT(*), COUNT(DISTINCT visitor) FROM games").fetchone()
+            out["games_24h"], out["visitors_24h"] = c.execute(
+                "SELECT COUNT(*), COUNT(DISTINCT visitor) FROM games "
+                "WHERE created_at > ?", (now - 86400,)).fetchone()
+            w = c.execute("SELECT SUM(won=1), SUM(won=0) FROM games").fetchone()
+            out["human_won"], out["human_lost"] = w[0] or 0, w[1] or 0
+    except Exception as e:                                  # noqa: BLE001
+        out["games_error"] = str(e)[:80]
+    # Claims are the ground truth this whole demo exists to collect, so they get
+    # counted from the event log rather than a cached number.
+    claimed = {v: set(names) for v, names in _CLAIMS.items() if names}
+    out["claims"] = sum(len(n) for n in claimed.values())
+    out["claimers"] = len(claimed)
+    out["gallery"] = MODEL.get("gal_n", 0)
+    return out
 
 
 def _worker_loop(n):
@@ -1328,6 +1391,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._ws_worker(ws, WSError)
             return self._ws_client(ws, WSError)
 
+        if self.path == "/api/stats":
+            return self._send(200, site_stats())
+
+        if self.path == "/stats":
+            with open(os.path.join(HERE, "stats.html"), "rb") as f:
+                return self._send(200, f.read(), "text/html; charset=utf-8")
+
         if self.path in ("/healthz", "/health"):
             ready = "ident" in MODEL and "cent" in MODEL
             body = {"ok": ready, "gallery": MODEL.get("gal_n", 0),
@@ -1358,6 +1428,14 @@ class Handler(BaseHTTPRequestHandler):
             vid, is_new = self.visitor_id()
             with open(os.path.join(HERE, "index.html"), "rb") as f:
                 html = f.read()
+            # The membership rule has to be on screen at page load -- that is
+            # exactly when a visitor decides whether this thing can work for
+            # them. It used to arrive only with the first identify response,
+            # so the notice sat blank through the whole first game. Substituted
+            # here rather than duplicated in the markup so GALLERY_BLURB stays
+            # the single source of truth.
+            html = html.replace(b"{{BLURB}}",
+                                html_escape(GALLERY_BLURB).encode("utf-8"), 1)
             # The dev tools are gated SERVER-side, not by a URL parameter, so a
             # production process cannot be talked into exposing them by anyone
             # who guesses "?dev=1". Without --dev the markup never reaches the

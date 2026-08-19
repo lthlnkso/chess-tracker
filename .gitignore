@@ -26,8 +26,9 @@ plots/data/
 .DS_Store
 
 # Visitor-reported feedback. Real usernames tied to gameplay, so it stays local
-# and out of a public repo; play/saved/*.json is kept deliberately as the
-# regression suite (see docs/prod_deployed.md "Golden test").
+# and out of a public repo. play/saved/*.json is the golden regression suite
+# (see docs/prod_deployed.md) and is ignored for the same reason -- it is real
+# games under a real lichess name, so it stays on the machine that recorded it.
 play/claims.jsonl
 play/giveups.jsonl
 play/saved/giveup_*.json
@@ -37,3 +38,9 @@ N.Y.C. Groceries Operator(s) RFP.pdf
 
 # Visitor game recordings are personal play data — keep them local.
 play/saved/*.json
+
+# Runtime stores written by the server: the job queue and the games database,
+# plus SQLite's WAL sidecars. Local play data, and regenerated on first run.
+play/*.db
+play/*.db-shm
+play/*.db-wal
