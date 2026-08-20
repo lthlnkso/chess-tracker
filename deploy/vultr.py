@@ -179,14 +179,23 @@ def destroy(iid):
     api(f"/instances/{iid}", "DELETE")
 
 
-def wait_active(iid, timeout=420):
-    """Poll until Vultr reports the instance running with an IP."""
+def wait_active(iid, timeout=1800):
+    """Poll until the instance is genuinely usable.
+
+    `status == "active"` is NOT enough: an instance created from a snapshot
+    reports active with an IP assigned while the disk image is still being
+    written, showing power_status=stopped and server_status=locked. Waiting on
+    status alone hands back a box that will refuse SSH for another ten minutes.
+    """
     for _ in range(timeout // 5):
         i = api(f"/instances/{iid}")["instance"]
-        if i["status"] == "active" and i["main_ip"] not in ("", "0.0.0.0"):
+        if (i["status"] == "active"
+                and i.get("power_status") == "running"
+                and i.get("server_status") in ("ok", "installingbooting")
+                and i["main_ip"] not in ("", "0.0.0.0")):
             return i
         time.sleep(5)
-    raise RuntimeError(f"instance {iid} never became active")
+    raise RuntimeError(f"instance {iid} never became usable")
 
 def plans_cmd(maxmo=None):
     """Every plan that could host this, cheapest first.

@@ -152,6 +152,13 @@ def main():
                          "to a different time control to measure cross-control "
                          "identification -- a visitor hands us bullet games and "
                          "their history is blitz.")
+    ap.add_argument("--held-out-names", default="",
+                    help="npy of usernames the model never trained on. gpid is the "
+                         "index into a union built by walking each shard's "
+                         "players.txt in order and assigning sequential ids to new "
+                         "lowercased names, so test_pids ARE resolvable to names by "
+                         "replaying that walk over the same shards in the same "
+                         "order -- see runpod/recover_heldout.py.")
     ap.add_argument("--allow-contaminated", action="store_true",
                     help="proceed when held-out status cannot be verified. Required "
                          "rather than assumed, because the failure is silent.")
@@ -257,9 +264,19 @@ def main():
     # them to a different one selects an arbitrary integer subset and prints a
     # reassuring number that means nothing -- which is exactly what happened on
     # 2026-08-19 and produced an inflated 94% that had to be retracted.
-    tp = ck.get("test_pids")
-    trained_shard = ck.get("shard") or ck.get("shards")
-    can_verify = tp is not None and trained_shard and str(trained_shard) in (args.shard, q_shard)
+    if args.held_out_names:
+        held = {str(x).lower() for x in np.load(args.held_out_names, allow_pickle=True)}
+        before = len(eligible)
+        eligible = [n for n in eligible if n in held]
+        print(f"held-out filter: {before:,} -> {len(eligible):,} players the model "
+              f"never trained on", flush=True)
+        if not eligible:
+            raise SystemExit("no eligible player is held out")
+        can_verify = True
+    else:
+        tp = ck.get("test_pids")
+        trained_shard = ck.get("shard") or ck.get("shards")
+        can_verify = tp is not None and trained_shard and str(trained_shard) in (args.shard, q_shard)
     if not can_verify:
         msg = (f"cannot verify held-out status: checkpoint's test_pids index "
                f"{trained_shard or 'an unrecorded shard'}, queries come from {q_shard}")
