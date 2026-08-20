@@ -640,6 +640,30 @@ def site_stats():
                 "WHERE kind='move' AND created > ?", (now - 180,)).fetchone()[0]
     except Exception as e:                                  # noqa: BLE001
         out["queue_error"] = str(e)[:80]
+    # Fleet shape, read from the two files that actually decide it: the nginx
+    # upstream is the truth about how many boxes are serving, and the
+    # autoscaler's state file is the truth about what it last did. Neither is a
+    # counter this process maintains, so neither can drift from reality.
+    try:
+        with open("/etc/nginx/sites-available/chess-lb.conf", encoding="utf-8") as f:
+            # `server 1.2.3.4:8081 ...;` -- not the `server {` block that
+            # opens the listener, which also starts with "server ".
+            out["backends"] = sum(
+                1 for ln in f
+                if ln.strip().startswith("server ") and ln.rstrip().endswith(";"))
+    except OSError:
+        out["backends"] = 1
+    try:
+        with open("/opt/chess-id/autoscale.json", encoding="utf-8") as f:
+            a = json.load(f)
+        out["queue_wait_p90_ms"] = a.get("p90_ms")
+        out["autoscale"] = a.get("last") or "idle"
+        out["accelerated"] = bool(a.get("accelerated"))
+        out["autoscale_age_s"] = round(now - (a.get("checked_at") or 0))
+    except (OSError, ValueError):
+        out["autoscale"] = "not running"
+        out["accelerated"] = False
+
     try:
         with contextlib.closing(sqlite3.connect(GAMES_PATH, timeout=10)) as c:
             c.execute("PRAGMA busy_timeout=5000")
@@ -1822,6 +1846,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"ok": True})
 
             return self._send(404, {"error": "not found"})
+
+        if self.path == "/api/accelerate":
+            # Shortens the autoscaler's clocks so a fan-in can be watched inside
+            # a test instead of waited out. Deliberately unauthenticated and
+            # deliberately harmless: it changes no thresholds, so a fleet that is
+            # genuinely busy still will not shrink -- the worst it can do is make
+            # an already-idle fleet shrink sooner.
+            try:
+                with open("/opt/chess-id/accelerate", "w") as f:
+                    f.write(str(time.time()))
+                return self._send(200, {"ok": True})
+            except OSError as e:
+                return self._send(200, {"ok": False, "error": str(e)[:80]})
 
         if self.path == "/api/game":
             # Recorded when the game ENDS, not when it is scored, so we get the

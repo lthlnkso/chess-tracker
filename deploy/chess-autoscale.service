@@ -1,0 +1,18 @@
+# Scales the fleet on measured queue wait. Main only -- a node must never try to
+# scale the fleet it is part of.
+[Unit]
+Description=chess-tracker autoscaler
+After=chess-id.service nginx.service
+BindsTo=chess-id.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/chess-id/deploy
+ExecStart=/opt/chess-id/.venv/bin/python /opt/chess-id/deploy/autoscale.py
+Restart=always
+RestartSec=10
+# Vultr credentials live here, root-only, outside the repo.
+Environment=HOME=/root
+
+[Install]
+WantedBy=multi-user.target

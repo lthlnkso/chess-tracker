@@ -155,10 +155,18 @@ def main():
     is_test[test_idx] = True
     train_pool = np.flatnonzero(~is_test)
     test_pids = ds.gpid[is_test]
+    # Store the NAMES too. Pids are only meaningful with the exact shard list in
+    # the exact order; names are meaningful on their own, forever.
+    heldout_names = [ds.players[int(i)] for i in test_pids]
     print(f"train {len(train_pool):,} players | held out {int(is_test.sum()):,}", flush=True)
 
     n_planes = ds.n_planes if ck is None else ck["n_planes"]
-    n_extra = N_TIME_FEATS if ck is None else ck["n_extra"]
+    # The DATASET always emits N_TIME_FEATS features, so the model has to accept
+    # that many regardless of what the checkpoint was trained with. Taking this
+    # from the checkpoint instead built a 2-feature model and fed it 3, which
+    # fails inside in_proj with a shape error rather than anywhere informative.
+    # The checkpoint is bridged by the zero-pad widening below.
+    n_extra = N_TIME_FEATS
     d_embed = args.d_embed if (ck is None or args.new_embed) else ck["d_embed"]
     model = MultiTaskModel(cfg, n_planes=n_planes, n_extra=n_extra,
                            d_embed=d_embed, n_time_bins=N_TIME_BINS,
@@ -249,7 +257,8 @@ def main():
              "n_planes": n_planes, "n_extra": n_extra, "d_embed": d_embed,
              "n_time_bins": N_TIME_BINS, "n_elo_bins": N_ELO_BINS,
              "n_game_slots": n_slots, "max_len_per_game": mlpg,
-             "step": step, "test_pids": test_pids, "loss_ema": ema,
+             "step": step, "test_pids": test_pids, "shards": list(args.shard),
+                "heldout_names": heldout_names, "loss_ema": ema,
              "loss": args.loss}
         if extra:
             d.update(extra)
@@ -312,7 +321,8 @@ def main():
                         "d_embed": d_embed, "n_time_bins": N_TIME_BINS,
                         "n_elo_bins": N_ELO_BINS, "n_game_slots": n_slots,
                         "max_len_per_game": mlpg, "step": step,
-                        "test_pids": test_pids, "loss_ema": ema,
+                        "test_pids": test_pids, "shards": list(args.shard),
+                "heldout_names": heldout_names, "loss_ema": ema,
                         "loss": args.loss, "max_games": n_slots},
                        os.path.join(args.out, "last.pt"))
 
@@ -321,7 +331,8 @@ def main():
                 "d_embed": d_embed, "n_time_bins": N_TIME_BINS,
                 "n_elo_bins": N_ELO_BINS, "n_game_slots": n_slots,
                 "max_len_per_game": mlpg, "step": step,
-                "test_pids": test_pids, "loss_ema": ema,
+                "test_pids": test_pids, "shards": list(args.shard),
+                "heldout_names": heldout_names, "loss_ema": ema,
                         "loss": args.loss, "max_games": n_slots},
                os.path.join(args.out, "last.pt"))
     with open(os.path.join(args.out, "history.json"), "w") as f:

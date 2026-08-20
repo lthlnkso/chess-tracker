@@ -26,6 +26,18 @@
         background:var(--good);margin-right:6px;vertical-align:middle}
   .foot{margin-top:26px;font-size:12.5px;color:var(--muted);line-height:1.6}
   a{color:var(--accent)}
+  /* The autoscaler is the one thing on this page that can be acted on, so it
+     gets its own row rather than a seventh identical tile. */
+  .fleet{margin-top:14px;display:flex;gap:14px;align-items:center;
+         justify-content:space-between;flex-wrap:wrap;
+         background:var(--panel);border:1px solid var(--line);
+         border-radius:10px;padding:14px 18px}
+  .fleet button{font:inherit;font-size:13px;padding:8px 14px;cursor:pointer;
+                border:1px solid var(--line);border-radius:8px;
+                background:var(--bg);color:var(--ink)}
+  .fleet button:hover{border-color:var(--muted)}
+  .fleet button:disabled{opacity:.5;cursor:default}
+  .fleet.fast{border-color:var(--accent)}
   /* auto-fit with a 180px floor collapses to ONE column at 375px, which turns
      six numbers into six full-screen cards. Below that width the count is
      pinned to two -- a stat card does not need 335px to show "0.33". */
@@ -59,6 +71,16 @@
       <div class="sm" id="games24">–</div></div>
     <div class="card"><div class="n" id="wl">–</div><div class="k">human W / L</div>
       <div class="sm">against the bot</div></div>
+    <div class="card"><div class="n" id="nodes">–</div><div class="k">serving boxes</div>
+      <div class="sm" id="qwait">–</div></div>
+  </div>
+
+  <div class="fleet">
+    <div>
+      <div class="k" style="margin:0">autoscaler</div>
+      <div class="sm" id="asstate">–</div>
+    </div>
+    <button id="accel">Accelerate wind-down</button>
   </div>
 
   <div class="foot">
@@ -83,9 +105,32 @@ async function tick(){
     $("games24").textContent= fmt(d.games_24h) + " in the last 24h";
     $("wl").textContent     = fmt(d.human_won) + " / " + fmt(d.human_lost);
     $("gal").textContent    = fmt(d.gallery);
+    $("nodes").textContent  = fmt(d.backends);
+    $("qwait").textContent  = d.queue_wait_p90_ms == null
+      ? "queue wait unknown"
+      : Math.round(d.queue_wait_p90_ms) + " ms queue wait (p90)";
+    // Say when the autoscaler last looked, not just what it last did: a stale
+    // state file and an idle one read identically otherwise.
+    const age = d.autoscale_age_s;
+    $("asstate").textContent = (d.autoscale || "unknown")
+      + (age == null ? "" : age > 90 ? ` — last checked ${age}s ago (stalled?)`
+                                     : ` — checked ${age}s ago`);
+    document.querySelector(".fleet").classList.toggle("fast", !!d.accelerated);
+    $("accel").textContent = d.accelerated ? "Wind-down accelerated"
+                                           : "Accelerate wind-down";
     $("upd").textContent    = "updated " + new Date().toLocaleTimeString();
   }catch(e){ $("upd").textContent = "stats unavailable"; }
 }
+
+$("accel").addEventListener("click", async () => {
+  const b = $("accel");
+  b.disabled = true; b.textContent = "…";
+  try{
+    await fetch("/api/accelerate", {method:"POST"});
+  }catch(e){ /* tick() reports the real state a moment later */ }
+  await tick();
+  b.disabled = false;
+});
 tick();
 // 15s, not 1s: this page must never be the thing that loads the box it reports on.
 setInterval(tick, 15000);
