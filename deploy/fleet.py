@@ -54,6 +54,27 @@ def sh(host, cmd, timeout=300):
     return r.returncode, r.stdout.strip(), r.stderr.strip()
 
 
+def snapshot_id():
+    """The node image id, from a durable path first.
+
+    /tmp is where the control machine happened to leave it during setup, and it
+    does not exist on main -- so the autoscaler detected load correctly, tried
+    to fan out, and failed with ENOENT on every tick while the queue backed up
+    to 4.8 s. An operator path and a daemon path must not read state from
+    different places.
+    """
+    for p in ("/opt/chess-id/snapshot_id",
+              os.path.expanduser("~/.chess_snapshot_id"),
+              "/tmp/chess_snap_id.txt"):
+        try:
+            v = open(p).read().strip()
+            if v:
+                return v
+        except OSError:
+            continue
+    raise RuntimeError("no snapshot id found; write one to /opt/chess-id/snapshot_id")
+
+
 def instances():
     ins = V.api("/instances").get("instances", [])
     main = next((i for i in ins if i.get("label") == MAIN_LABEL), None)
@@ -165,7 +186,7 @@ def fanout(n):
     if not main:
         sys.exit("no main host")
     V.guard_hours(n * 0.0658, 2.0)
-    snap = open("/tmp/chess_snap_id.txt").read().strip()
+    snap = snapshot_id()
     key = V.ssh_key_id("~/.ssh/id_ed25519.pub")
     used = {int(i["label"].rsplit("-", 1)[-1]) for i in nodes
             if i["label"].rsplit("-", 1)[-1].isdigit()}

@@ -121,6 +121,9 @@ def main():
         s["nodes"] = len(nodes)
         s["accelerated"] = fast
         s["checked_at"] = now
+        if s.get("last", "").startswith(("fanout", "fanin")) and \
+                now - s.get("last_action", 0) > 90:
+            s["last"] = ""            # let the live status take over again
 
         if p90 is None or not api_ok:
             if not api_ok:
@@ -159,6 +162,16 @@ def main():
                     print(s["last"], file=sys.stderr, flush=True)
         else:
             s["quiet"] = 0
+
+        # Refresh the status line every tick. It used to be written only when
+        # something happened, so a transient API failure left its error on the
+        # stats page indefinitely -- the page said the autoscaler was blocked
+        # for ten minutes after it had recovered.
+        if api_ok and not s.get("last", "").startswith(("fanout", "fanin")):
+            s["last"] = (f"watching — p90 {p90:.0f} ms over {n} moves, "
+                         f"{len(nodes)} node(s)"
+                         + (f", quiet {s['quiet']}/{need_quiet}" if s["quiet"] else ""))
+        s.pop("api_error", None) if api_ok else None
 
         s["history"].append({"t": round(now), "p90": round(p90 or 0, 1),
                              "n": len(nodes)})
