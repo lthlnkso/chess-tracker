@@ -198,6 +198,58 @@ def fanout(n):
 
 
 # ------------------------------------------------------------------- fanin --
+def node_claim_lines(ip):
+    rc, out, _ = sh(ip, "wc -l < /opt/chess-id/repo/play/claims.jsonl 2>/dev/null || echo 0")
+    try:
+        return int(out.strip() or 0)
+    except ValueError:
+        return 0
+
+
+def merge_claims(main_ip, node_ip, label):
+    """Append a node's claim events to main's log and make them live.
+
+    Verbatim, not replayed through /api/claim: each event carries the rank the
+    account had AT THE TIME it was claimed, computed server-side against that
+    node's gallery. Re-posting would recompute it against main and quietly
+    rewrite the one number that makes a claim usable as a labelled eval case.
+
+    Returns (added_events, ok).
+    """
+    want = node_claim_lines(node_ip)
+    if not want:
+        return 0, True
+    local = f"/tmp/{label}_claims.jsonl"
+    r1 = subprocess.run(f"scp -q {SSH.replace('ssh ', '')} "
+                        f"root@{node_ip}:/opt/chess-id/repo/play/claims.jsonl {local}",
+                        shell=True, capture_output=True, text=True)
+    if r1.returncode:
+        return 0, False
+    r2 = subprocess.run(f"scp -q {SSH.replace('ssh ', '')} {local} "
+                        f"root@{main_ip}:/tmp/node_claims.jsonl",
+                        shell=True, capture_output=True, text=True)
+    if r2.returncode:
+        return 0, False
+    before = node_claim_lines(main_ip)
+    rc, out, err = sh(main_ip, """
+set -e
+C=/opt/chess-id/repo/play/claims.jsonl
+# Append, never overwrite: this file IS the record, and main's own claims are
+# already in it.
+cat /tmp/node_claims.jsonl >> $C
+rm -f /tmp/node_claims.jsonl
+# The log is only read at boot, so tell the running process to replay it.
+. /opt/chess-id/worker.env
+curl -s -m 20 -X POST -H "Content-Type: application/json" \
+  -H "X-Worker-Token: $WORKER_TOKEN" \
+  http://127.0.0.1:8081/api/worker/reload-claims
+echo
+""")
+    after = node_claim_lines(main_ip)
+    ok = (after - before) == want and '"ok": true' in out.lower()
+    return want, ok
+
+
 def node_game_count(ip):
     rc, out, _ = sh(ip, "python3 -c \"import sqlite3;"
                         "c=sqlite3.connect('/opt/chess-id/games.db');"
@@ -277,6 +329,16 @@ def fanin(n):
             print(f"  {label}: merged {want} games ({before} -> {after})")
         else:
             print(f"  {label}: no games to merge")
+
+        # Claims are the only ground truth this demo ever collects -- everywhere
+        # else it is guessing. Losing them to a fan-in would be worse than
+        # losing the games.
+        n_claims, ok = merge_claims(main["main_ip"], ip, label)
+        if not ok:
+            print(f"  {label}: CLAIMS MERGE FAILED -- leaving it running")
+            continue
+        print(f"  {label}: merged {n_claims} claim event(s)")
+
         sh(main["main_ip"],
            f"ufw delete allow from {ip} to any port {SITE_PORT} proto tcp >/dev/null")
         V.destroy(v["id"])

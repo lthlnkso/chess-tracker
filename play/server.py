@@ -412,8 +412,11 @@ def features_from_times(ms_per_ply, base_s=60, inc_s=0):
         rem[side] = rem[side] - used[t] + inc_s
     log_s = np.log1p(np.clip(used, 0, None))
     frac = np.clip(used / np.maximum(before, 1e-6), 0.0, 1.0)
+    frac_total = np.clip(used / max(float(base_s), 1.0), 0.0, 1.0)
     feats[1:, 0] = log_s[:-1]
     feats[1:, 1] = frac[:-1]
+    if N_TIME_FEATS > 2:
+        feats[1:, 2] = frac_total[:-1]
     return feats
 
 
@@ -1779,6 +1782,24 @@ class Handler(BaseHTTPRequestHandler):
                 if n == 1:
                     return self._send(200, out[0] if out else {})
                 return self._send(200, {"jobs": out})
+
+            if self.path == "/api/worker/reload-claims":
+                # Fan-in appends a drained node's claim events to this box's
+                # log, and the log is only read at boot -- so without this the
+                # merged claims would sit on disk, invisible until the next
+                # restart. Replay is a full re-read and is idempotent: a claim
+                # already present is skipped, so calling it again costs a file
+                # scan and changes nothing else.
+                #
+                # Behind the worker token because it is an operator action, and
+                # on the worker route because that gate already exists and
+                # fails closed when no token is configured.
+                before = sum(len(v) for v in _CLAIMS.values())
+                load_claims()
+                after = sum(len(v) for v in _CLAIMS.values())
+                return self._send(200, {"ok": True, "claims": after,
+                                        "added": after - before,
+                                        "claimers": len([v for v in _CLAIMS.values() if v])})
 
             if self.path == "/api/worker/result":
                 # Must go through ws_deliver, not JOBS.finish*: a WebSocket

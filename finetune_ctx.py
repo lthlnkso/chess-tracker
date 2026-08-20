@@ -165,6 +165,25 @@ def main():
                            n_elo_bins=N_ELO_BINS, n_game_slots=n_slots).to(device)
     if ck is not None:
         sd = ck["model"]
+        # Widen the clock-feature inputs if the trunk was trained with fewer of
+        # them. encode() does cat([planes, extra]) and embed_head takes
+        # cat([pooled, elo_p, time_summary]), so in BOTH layers the extra
+        # features are the LAST columns -- appending zeros there leaves the model
+        # bit-identical to the checkpoint and lets it learn the new input from
+        # zero, the same way elo_cond is introduced.
+        old_ne = int(ck.get("n_extra", n_extra))
+        if old_ne < n_extra:
+            grow = n_extra - old_ne
+            for key in ("in_proj.weight", "embed_head.0.weight"):
+                w = sd[key]
+                pad = torch.zeros(w.shape[0], grow, dtype=w.dtype)
+                sd = dict(sd)
+                sd[key] = torch.cat([w, pad], dim=1)
+            print(f"clock features widened {old_ne} -> {n_extra}; new columns "
+                  f"zero-init so the trunk starts unchanged", flush=True)
+        elif old_ne > n_extra:
+            raise SystemExit(f"checkpoint has {old_ne} clock features, this build "
+                             f"expects {n_extra}; refusing to silently drop one")
         if args.new_embed and ck["d_embed"] != d_embed:
             # Only the head's OUTPUT width changes, so drop exactly that layer
             # and load everything else strictly -- a blanket strict=False would
