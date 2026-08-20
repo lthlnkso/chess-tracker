@@ -22,6 +22,7 @@ import os
 import sqlite3
 import sys
 import threading
+import urllib.request
 import time
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
@@ -605,7 +606,45 @@ def move_submit(req, hist, temp, vid):
             "human_white": human_white}
 
 
-def site_stats():
+def _winddown_eta(from_end):
+    """Seconds until the node `from_end` places from the door is removed.
+
+    An estimate, and labelled as one on the page. The autoscaler removes one
+    node per cooldown once the queue has been quiet for a run of ticks, so the
+    node at the back leaves first and each one behind it waits another cooldown.
+    Returns None when the fleet is busy -- nothing is winding down then, and a
+    countdown that keeps resetting is worse than no countdown.
+    """
+    try:
+        with open("/opt/chess-id/autoscale.json", encoding="utf-8") as f:
+            a = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if (a.get("p90_ms") or 0) >= 60.0:
+        return None                       # not quiet; nothing is leaving
+    div = 20.0 if a.get("accelerated") else 1.0
+    tick, need, cool = 15.0 / div, max(1, int(8 / div)), 120.0 / div
+    remaining = max(0, need - (a.get("quiet") or 0))
+    return round(remaining * tick + from_end * cool)
+
+
+def _node_ips():
+    """Backend IPs from the balancer config, excluding this box."""
+    ips = []
+    try:
+        with open("/etc/nginx/sites-available/chess-lb.conf", encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.strip()
+                if ln.startswith("server ") and ln.endswith(";"):
+                    host = ln.split()[1].split(":")[0]
+                    if host not in ("127.0.0.1", "localhost"):
+                        ips.append(host)
+    except OSError:
+        pass
+    return ips
+
+
+def site_stats(local_only=False):
     """Numbers for /stats, all derived from what we already store.
 
     Deliberately no new counters: a second source of truth for "how many games"
@@ -640,6 +679,13 @@ def site_stats():
                 "WHERE kind='move' AND created > ?", (now - 180,)).fetchone()[0]
     except Exception as e:                                  # noqa: BLE001
         out["queue_error"] = str(e)[:80]
+    if local_only:
+        # A node answering main's roll-up. Skip the fleet section entirely --
+        # only main has an nginx config or an autoscaler, and a node reporting
+        # "1 backend" is how /stats came to flicker between one box and many
+        # depending on which backend served the refresh.
+        return out
+
     # Fleet shape, read from the two files that actually decide it: the nginx
     # upstream is the truth about how many boxes are serving, and the
     # autoscaler's state file is the truth about what it last did. Neither is a
@@ -663,6 +709,40 @@ def site_stats():
     except (OSError, ValueError):
         out["autoscale"] = "not running"
         out["accelerated"] = False
+
+
+    # Roll up the nodes. Every box keeps its own games and its own queue, so
+    # main's numbers alone are 1/N of the truth once the fleet has fanned out.
+    # Best-effort and short-timeout: a slow node must not stall the page.
+    out["node_list"] = [{"ip": "127.0.0.1", "name": "main", "role": "balancer + site",
+                         "ok": True, "moves_24h": out.get("moves_24h", 0),
+                         "games": out.get("games_total", 0),
+                         "in_progress": out.get("in_progress", 0),
+                         "winddown_s": None}]
+    for pos, ip in enumerate(_node_ips()):
+        entry = {"ip": ip, "name": ip, "role": "site", "ok": False,
+                 "moves_24h": 0, "games": 0, "in_progress": 0}
+        # Fan-in takes the LAST node first, so the one nearest the end of the
+        # list is the one nearest the door. Position drives the estimate.
+        entry["winddown_s"] = _winddown_eta(len(_node_ips()) - 1 - pos)
+        out["node_list"].append(entry)
+        try:
+            req = urllib.request.Request(f"http://{ip}:8081/api/stats?local=1")
+            with urllib.request.urlopen(req, timeout=2) as f:
+                nd = json.load(f)
+        except Exception:                                    # noqa: BLE001
+            out["nodes_unreachable"] = out.get("nodes_unreachable", 0) + 1
+            continue
+        entry.update(ok=True, moves_24h=nd.get("moves_24h", 0),
+                     games=nd.get("games_total", 0),
+                     in_progress=nd.get("in_progress", 0))
+        for k in ("moves_24h", "in_progress", "games_total", "games_24h",
+                  "visitors_total", "visitors_24h", "human_won", "human_lost",
+                  "claims", "claimers"):
+            if isinstance(nd.get(k), (int, float)) and isinstance(out.get(k), (int, float)):
+                out[k] = out[k] + nd[k]
+        if nd.get("moves_per_min"):
+            out["moves_per_min"] = round(out.get("moves_per_min", 0) + nd["moves_per_min"], 2)
 
     try:
         with contextlib.closing(sqlite3.connect(GAMES_PATH, timeout=10)) as c:
@@ -1549,8 +1629,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._ws_worker(ws, WSError)
             return self._ws_client(ws, WSError)
 
-        if self.path == "/api/stats":
-            return self._send(200, site_stats())
+        if self.path.startswith("/api/stats"):
+            return self._send(200, site_stats(local_only="local=1" in self.path))
 
         if self.path == "/stats":
             with open(os.path.join(HERE, "stats.html"), "rb") as f:
@@ -1846,6 +1926,21 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"ok": True})
 
             return self._send(404, {"error": "not found"})
+
+        if self.path == "/api/winddown":
+            # Hands the request to the autoscaler rather than fanning in from
+            # here: it holds the lock that keeps two scaling actions from racing
+            # on the nginx config, and this process must not block a request
+            # thread for the minutes a drain-and-merge takes.
+            ip = str(req.get("ip") or "").strip()
+            if not ip or not all(c in "0123456789." for c in ip):
+                return self._send(400, {"ok": False, "error": "bad ip"})
+            try:
+                with open("/opt/chess-id/winddown_request", "w") as f:
+                    f.write(ip)
+                return self._send(200, {"ok": True, "queued": ip})
+            except OSError as e:
+                return self._send(200, {"ok": False, "error": str(e)[:80]})
 
         if self.path == "/api/accelerate":
             # Shortens the autoscaler's clocks so a fan-in can be watched inside

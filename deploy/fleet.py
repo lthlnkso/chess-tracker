@@ -126,6 +126,18 @@ server {{
     proxy_read_timeout 300s;
     proxy_send_timeout 300s;
 
+    # The operator view is fleet-wide and only main can produce it: only main
+    # has an nginx config, an autoscaler, or a way to reach the other nodes.
+    # Balanced like everything else it lands on a random backend, and a node
+    # reports its own slice -- which reads as the numbers flickering between
+    # "one box, nothing happening" and "lots of activity" on every refresh.
+    location ~ ^/(stats|api/stats|api/accelerate) {{
+        proxy_pass http://127.0.0.1:{SITE_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_read_timeout 30s;
+    }}
+
     location / {{
         proxy_pass http://chess_nodes;
         proxy_http_version 1.1;
@@ -181,12 +193,47 @@ echo node-ready
 """
 
 
+PROVISION = """
+set -e
+export DEBIAN_FRONTEND=noninteractive
+for i in $(seq 1 40); do fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || break; sleep 3; done
+apt-get update -qq >/dev/null 2>&1
+apt-get install -y -qq python3-venv python3-dev rsync >/dev/null 2>&1
+mkdir -p /opt/chess-id/repo /opt/chess-id/ckpt/final /opt/chess-id/play
+python3 -m venv /opt/chess-id/.venv
+/opt/chess-id/.venv/bin/pip -q install --index-url https://download.pytorch.org/whl/cpu "torch>=2.4" >/dev/null 2>&1
+/opt/chess-id/.venv/bin/pip -q install "numpy>=1.26" "python-chess>=1.11" >/dev/null 2>&1
+echo base-ready
+"""
+
+START = f"""
+set -e
+ln -sfn /opt/chess-id/ckpt /opt/chess-id/repo/ckpt 2>/dev/null || true
+systemctl daemon-reload
+systemctl start chess-id
+for i in $(seq 1 120); do
+  [ "$(curl -s -m 2 -o /dev/null -w '%{{http_code}}' localhost:{SITE_PORT}/healthz)" = "200" ] && break
+  sleep 2
+done
+systemctl start chess-move-worker@1 chess-move-worker@2 chess-identify-worker@1
+echo node-ready
+"""
+
+
 def fanout(n):
+    """Add n nodes, provisioned fresh from a stock image.
+
+    NOT from a snapshot. A snapshot of this plan is 193 GB because the plan has
+    a 180 GB disk, and restoring it left an instance sitting at
+    power=stopped/server=locked for over twelve minutes -- useless for reacting
+    to a spike. Installing from scratch takes about four minutes and, more
+    importantly, takes the SAME four minutes every time: the artifacts come from
+    main over the datacentre network at ~90 MB/s, not over the internet.
+    """
     main, nodes = instances()
     if not main:
         sys.exit("no main host")
     V.guard_hours(n * 0.0658, 2.0)
-    snap = snapshot_id()
     key = V.ssh_key_id("~/.ssh/id_ed25519.pub")
     used = {int(i["label"].rsplit("-", 1)[-1]) for i in nodes
             if i["label"].rsplit("-", 1)[-1].isdigit()}
@@ -195,27 +242,54 @@ def fanout(n):
         k = next(x for x in range(1, 99) if x not in used)
         used.add(k)
         i = V.api("/instances", "POST",
-                  {"region": REGION, "plan": NODE_PLAN, "snapshot_id": snap,
+                  {"region": REGION, "plan": NODE_PLAN, "os_id": 2284,
                    "label": f"{NODE_PREFIX}-{k}", "hostname": f"{NODE_PREFIX}-{k}",
                    "sshkey_id": [key], "backups": "disabled"})["instance"]
         made.append(i["id"])
-        print(f"  creating {NODE_PREFIX}-{k}")
+        print(f"  creating {NODE_PREFIX}-{k}", flush=True)
+
     ips = []
     for iid in made:
-        inst = V.wait_active(iid, timeout=600)
+        inst = V.wait_active(iid, timeout=900)
         ips.append(inst["main_ip"])
-        print(f"  {inst['label']} booted at {inst['main_ip']}")
+        print(f"  {inst['label']} booted at {inst['main_ip']}", flush=True)
+
     for ip in ips:
         for _ in range(60):
             if sh(ip, "true", timeout=20)[0] == 0:
                 break
-            time.sleep(6)
+            time.sleep(5)
         allow_node(main["main_ip"], ip)
-        rc, out, err = sh(ip, FIRST_BOOT, timeout=600)
-        print(f"  {ip}: {'ready' if 'node-ready' in out else 'FAILED ' + err[:120]}")
+        rc, out, err = sh(ip, PROVISION, timeout=900)
+        if "base-ready" not in out:
+            print(f"  {ip}: PROVISION FAILED {err[:120]}", flush=True)
+            continue
+        # Code, models and units from MAIN, in-datacentre. Main's own key is in
+        # its authorized_keys, so main can also reach a node it just made.
+        push = (f"rsync -a -e 'ssh -o StrictHostKeyChecking=no "
+                f"-o UserKnownHostsFile=/dev/null' ")
+        rc, out, err = sh(main["main_ip"], "\n".join([
+            f"{push}/opt/chess-id/ckpt/final/ root@{ip}:/opt/chess-id/ckpt/final/",
+            f"{push}/opt/chess-id/play/gallery_ctx10.npz root@{ip}:/opt/chess-id/play/",
+            f"{push}--exclude .git --exclude ckpt /opt/chess-id/repo/ root@{ip}:/opt/chess-id/repo/",
+            f"{push}/opt/chess-id/worker.env root@{ip}:/opt/chess-id/",
+            f"{push}/etc/systemd/system/chess-id.service /etc/systemd/system/chess-move-worker@.service "
+            f"/etc/systemd/system/chess-identify-worker@.service root@{ip}:/etc/systemd/system/",
+            "echo pushed"]), timeout=600)
+        if "pushed" not in out:
+            print(f"  {ip}: ARTIFACT PUSH FAILED {err[:120]}", flush=True)
+            continue
+        # A node serves; it does not balance and it does not scale.
+        sh(ip, "systemctl disable --now nginx chess-autoscale >/dev/null 2>&1 || true\n"
+               "rm -f /opt/chess-id/jobs.db* /opt/chess-id/games.db*\n"
+               ": > /opt/chess-id/repo/play/claims.jsonl")
+        rc, out, err = sh(ip, START, timeout=600)
+        print(f"  {ip}: {'ready' if 'node-ready' in out else 'START FAILED ' + err[:120]}",
+              flush=True)
+
     _, nodes = instances()
     write_upstream(main["main_ip"], [i["main_ip"] for i in nodes])
-    print(f"  balancer now fronts {1 + len(nodes)} node(s)")
+    print(f"  balancer now fronts {1 + len(nodes)} node(s)", flush=True)
 
 
 # ------------------------------------------------------------------- fanin --
@@ -301,6 +375,11 @@ rm -f /tmp/node_games.db
 """
 
 
+def fanin_one(node):
+    """Drain, merge and destroy one named node. Shares fanin's body."""
+    return _fanin_nodes([node])
+
+
 def fanin(n):
     """Drain, merge, VERIFY, then destroy -- in that order, and not otherwise.
 
@@ -316,6 +395,11 @@ def fanin(n):
         print("no nodes to remove")
         return
     victims = nodes[-n:] if n != "all" else nodes
+    return _fanin_nodes(victims)
+
+
+def _fanin_nodes(victims):
+    main, nodes = instances()
     keep = [i["main_ip"] for i in nodes if i not in victims]
     # Out of the balancer FIRST, so nothing new lands on a node being drained.
     write_upstream(main["main_ip"], keep)

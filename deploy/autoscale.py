@@ -25,6 +25,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -45,6 +46,32 @@ DOWN_COOLDOWN = 120.0
 MAX_NODES = 8               # a ceiling in code, not just in judgement
 ACCEL_FACTOR = 20.0
 ACCEL_WINDOW = 900.0        # the button stays in effect this long
+
+
+_BUSY = threading.Lock()
+
+
+def spawn(fn, arg, name):
+    """Run a scaling action off the control loop.
+
+    fanout() takes minutes -- create, boot, install, push artifacts, start. Run
+    inline it froze the loop for twelve minutes: no measurements, no further
+    decisions, and a stats page stuck on whatever it last said. The lock keeps
+    two actions from overlapping, which would race on the nginx config.
+    """
+    def run():
+        if not _BUSY.acquire(blocking=False):
+            print(f"{name}: another scaling action is already running",
+                  file=sys.stderr, flush=True)
+            return
+        try:
+            fn(arg)
+            print(f"{name}: done", file=sys.stderr, flush=True)
+        except Exception as e:                               # noqa: BLE001
+            print(f"{name} failed: {e}", file=sys.stderr, flush=True)
+        finally:
+            _BUSY.release()
+    threading.Thread(target=run, daemon=True).start()
 
 
 def accel() -> bool:
@@ -136,30 +163,51 @@ def main():
         cool_down = DOWN_COOLDOWN / div
         need_quiet = max(1, int(DOWN_TICKS / div))
 
+        # An operator asking for a specific node to go now, from the stats page.
+        # Honoured before the automatic decision: a person clicking a button has
+        # more context than a threshold does.
+        try:
+            with open("/opt/chess-id/winddown_request") as f:
+                want_ip = f.read().strip()
+            os.unlink("/opt/chess-id/winddown_request")
+        except OSError:
+            want_ip = ""
+        if want_ip and not _BUSY.locked():
+            target = next((i for i in nodes if i["main_ip"] == want_ip), None)
+            if target:
+                print(f"MANUAL: winding down {target['label']} ({want_ip})",
+                      file=sys.stderr, flush=True)
+                s["last_action"] = now
+                s["last"] = f"winding down {target['label']} on request"
+                spawn(F.fanin_one, target, "manual fanin")
+            else:
+                s["last"] = f"no node at {want_ip}"
+
+        busy = _BUSY.locked()
+        s["scaling"] = busy
+        if busy:
+            save_state(s)
+            time.sleep(TICK / div)
+            continue
+
         if p90 > UP_MS and len(nodes) < MAX_NODES:
             s["quiet"] = 0
             if now - s["last_action"] > cool_up:
                 print(f"UP: p90 {p90:.0f} ms over {n} moves, "
                       f"{len(nodes)} -> {len(nodes)+1}", file=sys.stderr, flush=True)
-                try:
-                    F.fanout(1)
-                    s["last_action"], s["last"] = now, f"fanout at p90 {p90:.0f}ms"
-                except Exception as e:                       # noqa: BLE001
-                    s["last"] = f"fanout failed: {str(e)[:120]}"
-                    print(s["last"], file=sys.stderr, flush=True)
+                s["last_action"] = now
+                s["last"] = f"fanout in progress (p90 {p90:.0f} ms)"
+                spawn(F.fanout, 1, "fanout")
         elif p90 < DOWN_MS:
             s["quiet"] += 1
             if (nodes and s["quiet"] >= need_quiet
                     and now - s["last_action"] > cool_down):
                 print(f"DOWN: p90 {p90:.0f} ms for {s['quiet']} ticks, "
                       f"{len(nodes)} -> {len(nodes)-1}", file=sys.stderr, flush=True)
-                try:
-                    F.fanin(1)
-                    s["last_action"], s["last"] = now, f"fanin at p90 {p90:.0f}ms"
-                    s["quiet"] = 0
-                except Exception as e:                       # noqa: BLE001
-                    s["last"] = f"fanin failed: {str(e)[:120]}"
-                    print(s["last"], file=sys.stderr, flush=True)
+                s["last_action"] = now
+                s["last"] = f"fanin in progress (p90 {p90:.0f} ms)"
+                s["quiet"] = 0
+                spawn(F.fanin, 1, "fanin")
         else:
             s["quiet"] = 0
 

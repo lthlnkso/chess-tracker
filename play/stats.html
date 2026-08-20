@@ -38,6 +38,28 @@
   .fleet button:hover{border-color:var(--muted)}
   .fleet button:disabled{opacity:.5;cursor:default}
   .fleet.fast{border-color:var(--accent)}
+  /* One card per box. Scrolls rather than growing the page: eight boxes during
+     a spike would otherwise push everything else off screen. */
+  .nodes{display:flex;flex-direction:column;gap:8px;
+         max-height:340px;overflow-y:auto;padding-right:4px}
+  .node{display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+        background:var(--panel);border:1px solid var(--line);
+        border-radius:10px;padding:11px 14px}
+  .node .who{min-width:150px}
+  .node .nm{font-weight:600;font-size:14px;font-variant-numeric:tabular-nums}
+  .node .role{font-size:11.5px;color:var(--muted)}
+  .node .fig{font-size:12.5px;color:var(--muted);
+             font-variant-numeric:tabular-nums;min-width:118px}
+  .node .fig b{color:var(--ink);font-weight:600}
+  .node .spacer{flex:1}
+  .node .eta{font-size:12.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+  .node button{font:inherit;font-size:12px;padding:6px 11px;cursor:pointer;
+               border:1px solid var(--line);border-radius:7px;
+               background:var(--bg);color:var(--ink);white-space:nowrap}
+  .node button:hover{border-color:var(--muted)}
+  .node button:disabled{opacity:.45;cursor:default}
+  .node.down{border-color:#c1541f}
+  .node.main{border-color:var(--good)}
   /* auto-fit with a 180px floor collapses to ONE column at 375px, which turns
      six numbers into six full-screen cards. Below that width the count is
      pinned to two -- a stat card does not need 335px to show "0.33". */
@@ -83,6 +105,9 @@
     <button id="accel">Accelerate wind-down</button>
   </div>
 
+  <div class="k" style="margin:22px 0 8px">serving boxes</div>
+  <div class="nodes" id="nodelist"></div>
+
   <div class="foot">
     Searching <b id="gal">–</b> lichess players who played 13+ bullet (1+0) games
     between January and June 2026. &nbsp;·&nbsp; <a href="/">play</a>
@@ -118,8 +143,57 @@ async function tick(){
     document.querySelector(".fleet").classList.toggle("fast", !!d.accelerated);
     $("accel").textContent = d.accelerated ? "Wind-down accelerated"
                                            : "Accelerate wind-down";
+    renderNodes(d.node_list || []);
     $("upd").textContent    = "updated " + new Date().toLocaleTimeString();
   }catch(e){ $("upd").textContent = "stats unavailable"; }
+}
+
+const mmss = s => s == null ? "\u2014"
+  : s < 60 ? s + "s" : Math.floor(s/60) + "m " + String(s%60).padStart(2,"0") + "s";
+
+function renderNodes(list){
+  const box = $("nodelist");
+  // Rebuild only when the set of boxes changes, so a click is not stolen by a
+  // refresh landing between mousedown and mouseup.
+  const sig = list.map(n => n.ip + ":" + n.ok).join("|");
+  if(box.dataset.sig !== sig){
+    box.dataset.sig = sig;
+    box.innerHTML = list.map(n => `
+      <div class="node ${n.role.startsWith("balancer") ? "main" : ""} ${n.ok ? "" : "down"}"
+           data-ip="${n.ip}">
+        <div class="who">
+          <div class="nm">${n.name}</div>
+          <div class="role">${n.role}${n.ok ? "" : " · unreachable"}</div>
+        </div>
+        <div class="fig"><b class="mv">–</b> moves / 24h</div>
+        <div class="fig"><b class="ip2">–</b> in progress</div>
+        <div class="spacer"></div>
+        <div class="eta"></div>
+        ${n.role.startsWith("balancer") ? ""
+          : '<button class="wd">Wind down now</button>'}
+      </div>`).join("");
+    box.querySelectorAll("button.wd").forEach(b => {
+      b.addEventListener("click", async ev => {
+        const ip = ev.target.closest(".node").dataset.ip;
+        ev.target.disabled = true; ev.target.textContent = "winding down…";
+        try{
+          await fetch("/api/winddown", {method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body: JSON.stringify({ip})});
+        }catch(e){ /* tick() shows the real state shortly */ }
+      });
+    });
+  }
+  // Values update every tick without touching the DOM structure.
+  list.forEach(n => {
+    const el = box.querySelector(`.node[data-ip="${n.ip}"]`);
+    if(!el) return;
+    el.querySelector(".mv").textContent  = fmt(n.moves_24h);
+    el.querySelector(".ip2").textContent = fmt(n.in_progress);
+    el.querySelector(".eta").textContent = n.winddown_s == null
+      ? (n.role.startsWith("balancer") ? "always on" : "holding")
+      : "winds down in " + mmss(n.winddown_s);
+  });
 }
 
 $("accel").addEventListener("click", async () => {
