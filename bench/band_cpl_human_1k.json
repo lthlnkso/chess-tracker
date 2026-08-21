@@ -1,0 +1,142 @@
+[
+ {
+  "band": "1000-1100",
+  "lo": 1000,
+  "n": 1000,
+  "mean_cpl": 95.229,
+  "se": 6.28653219557858,
+  "median_cpl": 37.5,
+  "blunder_pct": 25.0,
+  "games_scanned": 1491
+ },
+ {
+  "band": "1100-1200",
+  "lo": 1100,
+  "n": 1000,
+  "mean_cpl": 85.867,
+  "se": 5.095043746797645,
+  "median_cpl": 36.0,
+  "blunder_pct": 24.5,
+  "games_scanned": 1438
+ },
+ {
+  "band": "1200-1300",
+  "lo": 1200,
+  "n": 1000,
+  "mean_cpl": 80.838,
+  "se": 4.560985457589659,
+  "median_cpl": 36.0,
+  "blunder_pct": 23.3,
+  "games_scanned": 1446
+ },
+ {
+  "band": "1300-1400",
+  "lo": 1300,
+  "n": 1000,
+  "mean_cpl": 88.242,
+  "se": 5.090586165021029,
+  "median_cpl": 39.0,
+  "blunder_pct": 24.9,
+  "games_scanned": 1409
+ },
+ {
+  "band": "1400-1500",
+  "lo": 1400,
+  "n": 1000,
+  "mean_cpl": 74.545,
+  "se": 4.883208340701705,
+  "median_cpl": 27.0,
+  "blunder_pct": 20.9,
+  "games_scanned": 1405
+ },
+ {
+  "band": "1500-1600",
+  "lo": 1500,
+  "n": 1000,
+  "mean_cpl": 76.889,
+  "se": 5.3109240809480225,
+  "median_cpl": 28.0,
+  "blunder_pct": 21.7,
+  "games_scanned": 1352
+ },
+ {
+  "band": "1600-1700",
+  "lo": 1600,
+  "n": 1000,
+  "mean_cpl": 70.26,
+  "se": 4.793286763589051,
+  "median_cpl": 29.0,
+  "blunder_pct": 19.6,
+  "games_scanned": 1323
+ },
+ {
+  "band": "1700-1800",
+  "lo": 1700,
+  "n": 1000,
+  "mean_cpl": 70.122,
+  "se": 5.364881085827072,
+  "median_cpl": 26.0,
+  "blunder_pct": 17.7,
+  "games_scanned": 1332
+ },
+ {
+  "band": "1800-1900",
+  "lo": 1800,
+  "n": 1000,
+  "mean_cpl": 62.531,
+  "se": 4.556579798320058,
+  "median_cpl": 23.5,
+  "blunder_pct": 18.3,
+  "games_scanned": 1265
+ },
+ {
+  "band": "1900-2000",
+  "lo": 1900,
+  "n": 1000,
+  "mean_cpl": 58.117,
+  "se": 3.3569418179899055,
+  "median_cpl": 24.0,
+  "blunder_pct": 16.3,
+  "games_scanned": 1258
+ },
+ {
+  "band": "2000-2100",
+  "lo": 2000,
+  "n": 1000,
+  "mean_cpl": 59.79,
+  "se": 3.8852530279366735,
+  "median_cpl": 22.0,
+  "blunder_pct": 16.900000000000002,
+  "games_scanned": 1252
+ },
+ {
+  "band": "2100-2200",
+  "lo": 2100,
+  "n": 1000,
+  "mean_cpl": 63.403,
+  "se": 4.098850957301347,
+  "median_cpl": 26.0,
+  "blunder_pct": 17.8,
+  "games_scanned": 1243
+ },
+ {
+  "band": "2200-2300",
+  "lo": 2200,
+  "n": 1000,
+  "mean_cpl": 53.93,
+  "se": 3.340426252373722,
+  "median_cpl": 22.0,
+  "blunder_pct": 15.5,
+  "games_scanned": 1171
+ },
+ {
+  "band": "2300-2400",
+  "lo": 2300,
+  "n": 1000,
+  "mean_cpl": 54.813,
+  "se": 4.233208249434828,
+  "median_cpl": 21.5,
+  "blunder_pct": 15.0,
+  "games_scanned": 1163
+ }
+]
