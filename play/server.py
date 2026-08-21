@@ -1713,6 +1713,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, state([]))
         self._send(404, {"error": "not found"})
 
+    def handle_one_request(self):
+        """Swallow the disconnect races that are not faults.
+
+        /stats is polled every 15 s by every open tab and a game holds a socket
+        for its whole length, so a viewer closing a tab mid-response is routine
+        -- and it printed a full socketserver traceback each time. Real errors
+        still surface; only the three ways a peer can vanish are quiet.
+        """
+        try:
+            super().handle_one_request()
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            self.close_connection = True
+
     def _send_state(self, payload, vid, human_white):
         """Send a game state, recording the outcome if it is a terminal one.
 

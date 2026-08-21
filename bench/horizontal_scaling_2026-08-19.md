@@ -51,3 +51,24 @@ less per-move origin work), not more workers.
 
 Start **one** worker box. $0.0658/hr, $1.58/day, and it takes the site from ~96
 to ~160 concurrent players. A second is worth little until the origin grows.
+
+## Addendum: load balancing, not worker fan-out
+
+Worker fan-out stalled at ~192 players because workers only take the forward
+pass -- the origin still paid, per move, for the connection thread, the legality
+check, the queue write and the result push. Balancing across whole nodes
+distributes that too. Measured through nginx across main plus two nodes:
+
+| players | moves/s | move p50 | move p95 |
+|---|---|---|---|
+| 192 | 77.8 | 125 ms | 202 ms |
+| 320 | 120.4 | 249 ms | 980 ms |
+| 448 | **137.9** | 809 ms | 2031 ms |
+
+Against 95.5 moves/s peak for three worker boxes behind a single origin. Same
+hardware count, 44% more throughput, and 125 ms at 192 players where the
+worker-fan-out arrangement was already past its knee.
+
+That is the argument for the balancer over more workers: workers relieve the
+compute ceiling, nodes relieve the connection ceiling, and the connection
+ceiling is the one that binds first.
