@@ -25,15 +25,22 @@ from __future__ import annotations
 import numpy as np
 
 CLK_UNKNOWN = 0xFFFF
-# Three, not two, so the set is scale-free across time controls:
+# Two:
 #   [0] log seconds spent      -- absolute pace, which is identity-bearing
 #   [1] fraction of REMAINING  -- how much of what was left this move cost
-#   [2] fraction of the BASE   -- how much of the whole clock this move cost
-# [1] was already scale-free. [0] is not, and on its own it makes a 3 s move in
-# 3+0 look like a 3 s move in 1+0 while meaning something completely different.
-# [2] supplies the missing denominator. Measured before this existed: blitz
-# games scored the same with their real clocks as with a synthetic bullet track.
-N_TIME_FEATS = 3
+#
+# A third, fraction of the BASE clock, was added in bea597a to make the set
+# scale-free across time controls, and is removed again now that cross-time-
+# control is closed (the control arm put the ceiling at r@10 0.34 against 0.869
+# same-control). Inside a single time control it carries no information: for
+# 1+0 the base is always 60 s, so [2] is seconds/60 while [0] is log1p(seconds)
+# -- the same scalar in a different scaling.
+#
+# It is not free to keep. The input width is n_planes*64 + N_TIME_FEATS, so a
+# third feature makes 835 where every trained checkpoint's first layer is
+# 834 -> 256, and they refuse to load rather than degrade. That includes
+# ctx5_pre_elo.pt, the only checkpoint that can play at a requested rating.
+N_TIME_FEATS = 2
 
 
 def ms_used_per_ply(clocks: np.ndarray, tc_base_s: int, tc_inc_s: int) -> np.ndarray:
@@ -96,16 +103,11 @@ def time_features(clocks: np.ndarray, tc_base_s: int, tc_inc_s: int):
 
     valid = np.isfinite(ms)
 
-    base_ms = max(float(tc_base_s), 1.0) * 1000.0
-    frac_total = np.clip(np.nan_to_num(ms, nan=0.0) / base_ms,
-                         0.0, 1.0).astype(np.float32)
-
     feats = np.zeros((n, N_TIME_FEATS), dtype=np.float32)
     if n > 1:
         # shift by one ply: what the model may see at t is move t-1
         feats[1:, 0] = log_s[:-1]                # ~0-2.5, already well scaled
         feats[1:, 1] = frac[:-1]
-        feats[1:, 2] = frac_total[:-1]
         feats[1:][~valid[:-1]] = 0.0
 
     return feats, bucketize_seconds(ms / 1000.0), valid
