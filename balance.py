@@ -111,3 +111,80 @@ class EloBalancedSampler(Sampler):
         return (f"{len(self.groups)} Elo bins kept (bins {min(self.bin_ids)}-"
                 f"{max(self.bin_ids)}), rows/bin min {min(sizes):,} max {max(sizes):,}"
                 f" -> each bin drawn {100/len(self.groups):.1f}% of the time")
+
+
+# Gap buckets in rating points between the two players. Capped at 500 because
+# beyond that the pairing stops being a normal game -- lichess matchmaking makes
+# a 700-point gap rare enough that the ones that exist are mostly rematches,
+# handicap play or a smurf, and training on them teaches the exception.
+GAP_EDGES = np.array([50, 150, 250, 350, 450, 550], dtype=np.int64)
+
+
+def gap_buckets(gaps):
+    """|rating difference| -> bucket index. Last bucket is 'over 550, ignore'."""
+    return np.digitize(np.abs(np.asarray(gaps)), GAP_EDGES)
+
+
+class EloGapBalancedSampler(Sampler):
+    """Equal representation across (Elo band x opponent-gap bucket).
+
+    Same two-stage draw as EloBalancedSampler -- pick a cell, then a row inside
+    it -- for the same reason: one month of 60+0 is 48M game-sides and
+    WeightedRandomSampler routes through torch.multinomial, which hard-fails
+    above 2^24 categories.
+
+    Balancing the gap as well as the band is what puts mismatched games in front
+    of the model at a useful rate. In the raw data they are rare: lichess pairs
+    people close, so a 300+ gap is a small fraction of games, and a model trained
+    on the natural distribution sees almost none of the situation the demo
+    actually creates -- a visitor far stronger than the bot.
+
+    Cells past `max_bucket` are dropped entirely rather than balanced.
+    """
+
+    def __init__(self, elos, gaps, num_samples=None, min_count=200, seed=0,
+                 max_bucket=len(GAP_EDGES) - 1):
+        eb = elo_bins(np.asarray(elos))
+        gb = gap_buckets(gaps)
+        keep = gb <= max_bucket
+        # one integer per (band, bucket) cell
+        cell = eb.astype(np.int64) * (max_bucket + 1) + gb
+        cell = np.where(keep, cell, -1)
+        order = np.argsort(cell, kind="stable")
+        sc = cell[order]
+        bounds = np.flatnonzero(np.r_[True, sc[1:] != sc[:-1], True])
+        self.groups, self.cell_ids = [], []
+        for i in range(len(bounds) - 1):
+            if sc[bounds[i]] < 0:
+                continue                       # dropped: gap too wide
+            g = order[bounds[i]:bounds[i + 1]]
+            if len(g) >= min_count:
+                self.groups.append(g)
+                self.cell_ids.append((int(sc[bounds[i]]) // (max_bucket + 1),
+                                      int(sc[bounds[i]]) % (max_bucket + 1)))
+        if not self.groups:
+            raise ValueError("no (Elo, gap) cell has enough rows to balance")
+        self.n = int(num_samples or len(elos))
+        self.rng = np.random.default_rng(seed)
+
+    def __len__(self):
+        return self.n
+
+    def __iter__(self):
+        nb = len(self.groups)
+        left = self.n
+        while left > 0:
+            take = min(left, 1 << 16)
+            for bi in self.rng.integers(0, nb, size=take):
+                g = self.groups[bi]
+                yield int(g[self.rng.integers(0, len(g))])
+            left -= take
+
+    def describe(self):
+        sizes = [len(g) for g in self.groups]
+        bands = sorted({c[0] for c in self.cell_ids})
+        buckets = sorted({c[1] for c in self.cell_ids})
+        return (f"{len(self.groups)} (Elo x gap) cells kept over {len(bands)} bands "
+                f"and {len(buckets)} gap buckets, rows/cell min {min(sizes):,} "
+                f"max {max(sizes):,} -> each cell drawn "
+                f"{100/len(self.groups):.2f}% of the time")

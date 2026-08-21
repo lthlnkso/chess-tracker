@@ -369,7 +369,7 @@ class MultiTaskModel(nn.Module):
     def __init__(self, c: Config = Config(), n_planes: int = 8,
                  n_extra: int = 2, d_embed: int = 128,
                  n_time_bins: int = 9, n_elo_bins: int = 20, n_game_slots: int = 1,
-                 elo_cond: bool = False):
+                 elo_cond: bool = False, elo_steer: bool = False):
         super().__init__()
         self.cfg = c
         self.n_planes = n_planes
@@ -430,9 +430,23 @@ class MultiTaskModel(nn.Module):
         # checkpoint that has never trained this is bit-identical to before.
         self.elo_cond = (nn.Embedding(n_elo_bins + 1, c.d_model)
                          if elo_cond else None)
+        # Self-conditioning: the model's own running rating estimate steers move
+        # choice, so no caller has to supply a rating.
+        #
+        # The estimate must be CAUSAL. elo_head normally reads a pool over the
+        # whole game, and feeding that back into the move at ply t would let the
+        # move be chosen using plies after t -- the same leak the time features
+        # are carefully shifted to avoid. causal_elo_p() pools the PREFIX only.
+        #
+        # Zero-init, matching elo_cond: a checkpoint that never trained this is
+        # bit-identical to one built without it.
+        self.elo_steer = nn.Linear(n_elo_bins, c.d_model) if elo_steer else None
+
         self.apply(ChessTransformer._init)
         if self.elo_cond is not None:
             nn.init.zeros_(self.elo_cond.weight)
+        if self.elo_steer is not None:
+            nn.init.zeros_(self.elo_steer.weight); nn.init.zeros_(self.elo_steer.bias)
 
     # -- trunk ------------------------------------------------------------
     def encode(self, planes, extra, game_slot=None, ply_pos=None, elo_bin=None):
@@ -464,9 +478,27 @@ class MultiTaskModel(nn.Module):
         w = keep.unsqueeze(-1).to(h.dtype)
         return (h * w).sum(1) / w.sum(1).clamp(min=1)
 
+    def causal_elo_p(self, h, pad_mask, my_turn=None):
+        """Rating estimate from the PREFIX at every ply -- (B, T, n_elo_bins).
+
+        A running mean over plies <= t, so the estimate available when choosing
+        move t never contains move t or anything after it. Uses the same
+        elo_head as the whole-game estimate, so the two share a calibration.
+        """
+        keep = ~pad_mask
+        if my_turn is not None:
+            keep = keep & my_turn
+        w = keep.unsqueeze(-1).to(h.dtype)
+        running = (h * w).cumsum(1) / w.cumsum(1).clamp(min=1)
+        return F.softmax(self.elo_head(running).float(), dim=-1)
+
     # -- heads ------------------------------------------------------------
-    def score_candidates(self, h, cands, ply_idx):
+    def score_candidates(self, h, cands, ply_idx, elo_p=None):
         ctx = h.gather(1, ply_idx[..., None].expand(-1, -1, h.size(-1)))
+        if self.elo_steer is not None and elo_p is not None:
+            # the prefix estimate AT each scored ply, not a game-level one
+            ep = elo_p.gather(1, ply_idx[..., None].expand(-1, -1, elo_p.size(-1)))
+            ctx = ctx + self.elo_steer(ep.to(ctx.dtype))
         B, P, C = cands.shape[:3]
         e = self.ln_c(self.cand_enc(cands.reshape(B, P, C, -1).to(ctx.dtype)))
         return torch.einsum("bpd,bpcd->bpc", ctx, e) * self.scale
@@ -474,7 +506,9 @@ class MultiTaskModel(nn.Module):
     def forward(self, planes, extra, cands, ply_idx, pad_mask, my_turn=None,
                 game_slot=None, ply_pos=None, elo_bin=None):
         h = self.encode(planes, extra, game_slot, ply_pos, elo_bin)
-        move_logits = self.score_candidates(h, cands, ply_idx)
+        ep = (self.causal_elo_p(h, pad_mask, my_turn)
+              if self.elo_steer is not None else None)
+        move_logits = self.score_candidates(h, cands, ply_idx, ep)
         time_logits = self.time_head(h)                       # (B, T, n_time_bins)
         pooled = self._pool(h, pad_mask, my_turn)
         elo_logits = self.elo_head(pooled)                    # (B, n_elo_bins)

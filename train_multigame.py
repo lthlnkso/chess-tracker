@@ -26,7 +26,7 @@ from torch.utils.data import DataLoader, Subset
 from multigame_data import MultiGameDataset, collate_multigame
 from model import elo_to_bin, MultiTaskModel, Config, multitask_loss, N_ELO_BINS
 from timefeat import N_TIME_FEATS, N_TIME_BINS, TIME_CENTRES
-from balance import EloBalancedSampler
+from balance import EloBalancedSampler, EloGapBalancedSampler
 
 
 def lr_at(step, total, base, warmup):
@@ -145,6 +145,17 @@ def main():
                     help="weight on the CPL term. 0 disables it even with a "
                          "corpus attached, which is how the control arm runs.")
     ap.add_argument("--balance-elo", action="store_true")
+    ap.add_argument("--balance-gap", action="store_true",
+                    help="balance across (Elo band x opponent-gap bucket), not "
+                         "just band. lichess pairs people close, so a model "
+                         "trained on the natural distribution barely sees the "
+                         "mismatch the demo actually creates. Implies "
+                         "--balance-elo.")
+    ap.add_argument("--elo-steer", action="store_true",
+                    help="let the model's OWN running rating estimate steer move "
+                         "choice, instead of needing a rating supplied. The "
+                         "estimate is causal (prefix only), so the move at ply t "
+                         "cannot see ply t or later.")
     ap.add_argument("--patience", type=int, default=0,
                     help="stop after this many evals with no val move_acc "
                          "improvement. 0 = run the full clock. This is what "
@@ -203,12 +214,21 @@ def main():
 
     common = dict(batch_size=args.batch, num_workers=args.workers,
                   collate_fn=collate_multigame, pin_memory=device == "cuda")
-    if args.balance_elo:
+    if args.balance_elo or args.balance_gap:
         elo = np.array([int(np.median([
             ds.meta[sh][g]["white_elo" if s == 0 else "black_elo"]
             for sh, g, s in zip(*ds.groups[i])][:8])) for i in tr])
-        sampler = EloBalancedSampler(elo, num_samples=len(tr), seed=args.seed)
-        print(f"Elo balancing: {sampler.describe()}", flush=True)
+        if args.balance_gap:
+            # opponent rating, read the same way but from the other seat
+            opp = np.array([int(np.median([
+                ds.meta[sh][g]["black_elo" if s == 0 else "white_elo"]
+                for sh, g, s in zip(*ds.groups[i])][:8])) for i in tr])
+            sampler = EloGapBalancedSampler(elo, elo - opp, num_samples=len(tr),
+                                            seed=args.seed)
+            print(f"Elo+gap balancing: {sampler.describe()}", flush=True)
+        else:
+            sampler = EloBalancedSampler(elo, num_samples=len(tr), seed=args.seed)
+            print(f"Elo balancing: {sampler.describe()}", flush=True)
         train_dl = DataLoader(Subset(ds, tr.tolist()), sampler=sampler,
                               drop_last=True, **common)
     else:
@@ -223,7 +243,8 @@ def main():
                            d_embed=args.d_embed, n_time_bins=N_TIME_BINS,
                            n_elo_bins=N_ELO_BINS,
                            n_game_slots=args.max_games,
-                           elo_cond=args.elo_cond).to(device)
+                           elo_cond=args.elo_cond,
+                           elo_steer=args.elo_steer).to(device)
     print(f"model {sum(p.numel() for p in model.parameters())/1e6:.2f}M params "
           f"on {device}", flush=True)
 
@@ -320,7 +341,7 @@ def main():
                             "n_planes": ds.n_planes, "n_extra": N_TIME_FEATS,
                             "d_embed": args.d_embed, "n_time_bins": N_TIME_BINS,
                             "n_elo_bins": N_ELO_BINS, "n_game_slots": args.max_games,
-                "elo_cond": args.elo_cond,
+                "elo_cond": args.elo_cond, "elo_steer": args.elo_steer,
                             "max_len_per_game": args.max_len_per_game,
                             "step": step, "val": ev},
                            os.path.join(args.out, "last.pt"))
@@ -335,7 +356,7 @@ def main():
                 "n_planes": ds.n_planes, "n_extra": N_TIME_FEATS,
                 "d_embed": args.d_embed, "n_time_bins": N_TIME_BINS,
                 "n_elo_bins": N_ELO_BINS, "n_game_slots": args.max_games,
-                "elo_cond": args.elo_cond,
+                "elo_cond": args.elo_cond, "elo_steer": args.elo_steer,
                 "max_len_per_game": args.max_len_per_game,
                 "step": step, "val": ev},
                os.path.join(args.out, "last.pt"))
