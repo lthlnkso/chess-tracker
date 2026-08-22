@@ -306,6 +306,14 @@ def main():
                                          b["pad_mask"], b["my_turn"], b["game_slot"], pp,
                                          elo_bin=eb)
                 loss, st = multitask_loss(ml, tl, el, b, *w, **lossk)
+            # Abort on divergence instead of burning the budget on NaN, and do
+            # it BEFORE backward so no NaN gradient ever reaches the weights.
+            # The previous run produced NaN from step ~11k and kept going for
+            # 4,000 more steps because nothing was watching.
+            if not torch.isfinite(loss):
+                print(f"NON-FINITE loss at step {step}; aborting", flush=True)
+                stop = True
+                break
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)

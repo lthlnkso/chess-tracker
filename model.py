@@ -488,9 +488,20 @@ class MultiTaskModel(nn.Module):
         keep = ~pad_mask
         if my_turn is not None:
             keep = keep & my_turn
-        w = keep.unsqueeze(-1).to(h.dtype)
-        running = (h * w).cumsum(1) / w.cumsum(1).clamp(min=1)
-        return F.softmax(self.elo_head(running).float(), dim=-1)
+        # float32, and NO GRADIENT. Both matter.
+        #
+        # cumsum's backward is a reverse-cumsum, so ply 0 receives the summed
+        # gradient of every later ply -- measured 12,728x the gradient reaching
+        # the last ply over a 1600-ply context. clip_grad_norm_ clips the GLOBAL
+        # norm, so it rescales that imbalance rather than removing it, and the
+        # first run went NaN at ~11k steps. elo_head is already trained by its
+        # own supervised loss on the whole-game pool, so this is a READ-OUT of
+        # it: the move loss has no business flowing back through 1,600 prefix
+        # terms. elo_steer still trains normally, on the detached estimate.
+        with torch.no_grad():
+            w = keep.unsqueeze(-1).float()
+            running = (h.float() * w).cumsum(1) / w.cumsum(1).clamp(min=1)
+            return F.softmax(self.elo_head(running.to(h.dtype)).float(), dim=-1)
 
     # -- heads ------------------------------------------------------------
     def score_candidates(self, h, cands, ply_idx, elo_p=None):
