@@ -38,6 +38,7 @@ import chess
 from bitboards import board_to_planes8, decode_move, n_planes_compact
 from bitboards import encode_move
 from fastboard import N_BB, snapshot_bb, rights_bb, successor_bb, encode_batch
+from nply import n_ply_futures
 from timefeat import time_features, N_TIME_FEATS
 
 
@@ -78,6 +79,7 @@ class MultiGameDataset(Dataset):
 
     def __init__(self, shard, max_games: int = 3, max_len_per_game: int = 80,
                  plies_per_game: int = 8, n_cand: int = 12, with_rights: bool = True,
+                 cand_depth: int = 1, late_bias: float = 8.0,
                  min_games: int = 3, vary_games: bool = True, seed: int = 0,
                  same_colour: bool = False, cpl=None, cpl_only: bool = False):
         shards = [shard] if isinstance(shard, (str, bytes, os.PathLike)) else list(shard)
@@ -99,6 +101,13 @@ class MultiGameDataset(Dataset):
         self.max_len_per_game = max_len_per_game
         self.plies_per_game = plies_per_game
         self.n_cand = n_cand
+        # 1 keeps the original task bit-for-bit: every legal successor, no
+        # sampling. >1 asks which state the game reached `cand_depth` plies out,
+        # with distractors that follow the true line and diverge once -- see
+        # nply.py for why random continuations would make the task easier, not
+        # harder.
+        self.cand_depth = cand_depth
+        self.late_bias = late_bias
         self.with_rights = with_rights
         self.n_planes = n_planes_compact(with_rights)
         self.vary_games = vary_games
@@ -243,20 +252,41 @@ class MultiGameDataset(Dataset):
             true_mv = decode_move(int(codes[t]))
             k = slot.get(t)
             if k is not None:
-                others = [m for m in board.legal_moves if m != true_mv]
-                if len(others) > C - 1:
-                    others = [others[x] for x in rng.choice(len(others), C - 1, replace=False)]
-                sel = [true_mv] + others
-                order = rng.permutation(len(sel))
-                labels[k] = int(np.flatnonzero(order == 0)[0])
-                nsel[k] = len(sel)
                 base = k * C
-                for x, pi in enumerate(order):
-                    cs, cr = successor_bb(board, sel[pi], pov)
-                    cnd[base + x] = cs
-                    cnd_mv[base + x] = encode_move(sel[pi])
-                    if self.with_rights:
-                        cnd_r[base + x] = cr
+                if self.cand_depth <= 1:
+                    others = [m for m in board.legal_moves if m != true_mv]
+                    if len(others) > C - 1:
+                        others = [others[x] for x in rng.choice(len(others), C - 1, replace=False)]
+                    sel = [true_mv] + others
+                    order = rng.permutation(len(sel))
+                    labels[k] = int(np.flatnonzero(order == 0)[0])
+                    nsel[k] = len(sel)
+                    for x, pi in enumerate(order):
+                        cs, cr = successor_bb(board, sel[pi], pov)
+                        cnd[base + x] = cs
+                        cnd_mv[base + x] = encode_move(sel[pi])
+                        if self.with_rights:
+                            cnd_r[base + x] = cr
+                else:
+                    # N-ply futures. cnd_mv stays zero: past depth 1 a candidate
+                    # is a position, not a move, so there is nothing for the CPL
+                    # corpus to join on -- cpl_ok below therefore stays False and
+                    # the graded term switches itself off, which is the correct
+                    # behaviour rather than a silent mismatch.
+                    fut = n_ply_futures(board, [decode_move(int(c)) for c in
+                                                codes[t:t + self.cand_depth]],
+                                        self.cand_depth, C, rng, pov=pov,
+                                        late_bias=self.late_bias,
+                                        with_rights=self.with_rights)
+                    if fut is None:
+                        nsel[k] = 0
+                    else:
+                        m = fut["n_valid"]
+                        cnd[base:base + m] = fut["snaps"]
+                        if self.with_rights and fut["rights"] is not None:
+                            cnd_r[base:base + m] = fut["rights"]
+                        labels[k] = fut["label"]
+                        nsel[k] = m
             board.push(true_mv)
 
         # Each game in a sample can be a different colour, so the POV mirror is

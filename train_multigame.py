@@ -126,6 +126,13 @@ def main():
                          "1..max_games and clamps to what a player has, so a "
                          "lower threshold costs nothing.")
     ap.add_argument("--plies-per-game", type=int, default=8)
+    ap.add_argument("--cand-depth", type=int, default=1,
+                    help="plies ahead the candidate states sit. 1 is the "
+                         "original task (every legal successor). >1 asks which "
+                         "state the game reached N plies out.")
+    ap.add_argument("--late-bias", type=float, default=8.0,
+                    help="how strongly candidate divergence is pushed to the "
+                         "last ply. Higher = harder negatives AND faster.")
     ap.add_argument("--n-cand", type=int, default=16)
     ap.add_argument("--d-embed", type=int, default=128)
     ap.add_argument("--workers", type=int, default=28)
@@ -202,7 +209,8 @@ def main():
 
     ds = MultiGameDataset(args.shard, max_games=args.max_games,
                           max_len_per_game=args.max_len_per_game,
-                          plies_per_game=args.plies_per_game, n_cand=args.n_cand,
+                          plies_per_game=args.plies_per_game, n_cand=args.n_cand, cand_depth=args.cand_depth,
+                          late_bias=args.late_bias,
                           min_games=args.min_games or args.max_games,
                           seed=args.seed, cpl=cpl,
                           cpl_only=args.cpl_only)
