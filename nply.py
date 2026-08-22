@@ -61,7 +61,7 @@ def _snap(board: chess.Board, pov: bool, with_rights: bool):
 def n_ply_futures(board: chess.Board, true_line, depth: int, n_cand: int,
                   rng, pov: bool | None = None, policy: str = "perturb",
                   late_bias: float = 2.0, with_rights: bool = True,
-                  max_tries: int = 6):
+                  max_tries: int = 6, own_plies_only: bool = True):
     """K candidate states `depth` plies ahead; exactly one is what really happened.
 
     `board` is the position before the window and is never mutated.
@@ -106,16 +106,29 @@ def n_ply_futures(board: chess.Board, true_line, depth: int, n_cand: int,
     snaps, rights = [], []
 
     def add(b: chess.Board) -> bool:
-        s, r = _snap(b, pov, with_rights)
-        key = (s, r)
+        st, r = _snap(b, pov, with_rights)
+        key = (st, r)
         if key in seen:
             return False
         seen.add(key)
-        snaps.append(s)
+        snaps.append(st)
         rights.append(r)
         return True
 
     add(true_board)                      # the truth is always slot 0 pre-shuffle
+
+    # Prefix boards and the legal alternatives at each divergence ply are shared
+    # across every distractor that diverges there. The naive version rebuilt both
+    # per candidate, which cost 1.4M generate_legal_moves calls per 120 samples
+    # -- 133x the depth-1 task. Build each once.
+    prefix = [board.copy(stack=False)]
+    for mv in line[:reached - 1]:
+        nb = prefix[-1].copy(stack=False)
+        nb.push(mv)
+        prefix.append(nb)
+    alts_cache: dict[int, list] = {}
+    # which plies in the window the target player actually moved on
+    div_plies = [i for i in range(reached) if prefix[i].turn == pov]
 
     want = n_cand - 1
     tries = 0
@@ -126,19 +139,45 @@ def n_ply_futures(board: chess.Board, true_line, depth: int, n_cand: int,
             if _play_random(cand, reached, rng) < reached:
                 continue
         else:
-            # Diverge at ONE ply, biased late: a divergence at the final ply
-            # follows the real game exactly until then and leaves no random tail,
-            # which is the hardest negative this construction can make.
+            # Diverge at ONE ply, biased late. A divergence at the final ply
+            # follows the real game exactly until then and leaves NO random tail
+            # -- simultaneously the hardest negative available and the cheapest
+            # to build, so difficulty and speed pull the same way here.
             u = rng.random() ** (1.0 / max(late_bias, 1e-6))
             d = min(reached - 1, int(u * reached))
-            cand = board.copy(stack=False)
-            for mv in line[:d]:
-                cand.push(mv)
-            alts = [m for m in cand.legal_moves if m != line[d]]
+            if own_plies_only and div_plies:
+                # Diverge only on plies the TARGET PLAYER moved.
+                #
+                # A late divergence differs from the truth by exactly one move,
+                # and half of those moves belong to the opponent. Telling those
+                # apart teaches the model about a stranger, not about the player
+                # it is supposed to identify -- the depth-1 task never had this
+                # problem because the only decision in it was the player's own.
+                d = div_plies[min(int(u * len(div_plies)), len(div_plies) - 1)]
+            alts = alts_cache.get(d)
+            if alts is None:
+                alts = [m for m in prefix[d].legal_moves if m != line[d]]
+                alts_cache[d] = alts
             if not alts:
                 continue
-            cand.push(alts[rng.integers(len(alts))])
-            if _play_random(cand, reached - d - 1, rng) < reached - d - 1:
+            alt = alts[rng.integers(len(alts))]
+            tail = reached - d - 1
+            if tail == 0:
+                # Last-ply divergence: the candidate IS a successor of a position
+                # we already hold, so skip the board copy, the push and the
+                # snapshot entirely and use the same bitboard path the depth-1
+                # task uses. High late_bias sends most candidates down here,
+                # which is why difficulty and speed pull the same way.
+                cs, cr = successor_bb(prefix[d], alt, pov)
+                if (cs, cr if with_rights else None) in seen:
+                    continue
+                seen.add((cs, cr if with_rights else None))
+                snaps.append(cs)
+                rights.append(cr if with_rights else None)
+                continue
+            cand = prefix[d].copy(stack=False)
+            cand.push(alt)
+            if _play_random(cand, tail, rng) < tail:
                 continue
         add(cand)
 
