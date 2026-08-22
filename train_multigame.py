@@ -271,6 +271,7 @@ def main():
 
     hist, curve = [], []
     step, t0, stop = 0, time.time(), False
+    skipped = 0
     budget = args.max_hours * 3600
     model.train()
     best_acc, bad_evals = -1.0, 0
@@ -306,17 +307,35 @@ def main():
                                          b["pad_mask"], b["my_turn"], b["game_slot"], pp,
                                          elo_bin=eb)
                 loss, st = multitask_loss(ml, tl, el, b, *w, **lossk)
-            # Abort on divergence instead of burning the budget on NaN, and do
-            # it BEFORE backward so no NaN gradient ever reaches the weights.
-            # The previous run produced NaN from step ~11k and kept going for
-            # 4,000 more steps because nothing was watching.
-            if not torch.isfinite(loss):
-                print(f"NON-FINITE loss at step {step}; aborting", flush=True)
-                stop = True
-                break
             opt.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+            # SKIP the step if anything is non-finite -- never abort, and never
+            # let it reach the weights.
+            #
+            # clip_grad_norm_ computes ONE global norm, so a single NaN gradient
+            # anywhere makes that norm NaN and the rescale writes NaN into every
+            # gradient in the model. The next opt.step() then destroys every
+            # weight at once: measured 145 of 149 tensors NaN in one step, with
+            # the training loss flat at 2.4 right up to the step before.
+            #
+            # This is what actually killed three runs, at steps 11k, 15.4k and
+            # 29.7k. Guarding the LOSS instead does not help -- the loss at the
+            # fatal step was finite; it was the backward that produced NaN. Each
+            # earlier fix cut how often that happened, which is why survival kept
+            # roughly doubling, but the amplifier was never removed.
+            if not (torch.isfinite(gnorm) and torch.isfinite(loss)):
+                skipped += 1
+                opt.zero_grad(set_to_none=True)
+                if skipped <= 20 or skipped % 100 == 0:
+                    print(f"  skip step {step} (non-finite grad/loss); "
+                          f"{skipped} skipped so far", flush=True)
+                if skipped > 500:
+                    print("too many skipped steps; aborting", flush=True)
+                    stop = True
+                    break
+                continue
             opt.step()
             step += 1
 
