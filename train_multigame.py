@@ -83,10 +83,12 @@ def evaluate(model, loader, device, max_batches, w, lossk, elo_cond=False):
         b = to_dev(b, device)
         pp = ply_positions(b["game_slot"], b["pad_mask"])
         eb = elo_to_bin(b["elo"]) if elo_cond else None
-        ml, tl, el, _, _ = model(b["planes"], b["extra"], b["cands"], b["ply_idx"],
-                                 b["pad_mask"], b["my_turn"], b["game_slot"], pp,
-                                 elo_bin=eb)
-        _, st = multitask_loss(ml, tl, el, b, *w, **lossk)
+        ml, tl, el, _, hh = model(b["planes"], b["extra"], b["cands"], b["ply_idx"],
+                                  b["pad_mask"], b["my_turn"], b["game_slot"], pp,
+                                  elo_bin=eb)
+        core_m = model.module if hasattr(model, "module") else model
+        rl = core_m.result_logits(hh) if lossk.get("w_result", 0) > 0 else None
+        _, st = multitask_loss(ml, tl, el, b, *w, result_logits=rl, **lossk)
         for k, v in st.items():
             if v == v:
                 acc[k] = acc.get(k, 0.0) + v
@@ -141,6 +143,12 @@ def main():
                          "corpus covers ~0.2%% of a shard, so without this the "
                          "CPL term almost never fires and the arms are "
                          "indistinguishable. BOTH arms must set it.")
+    ap.add_argument("--w-result", type=float, default=0.0,
+                    help="weight on the win/draw/loss head. Auxiliary supervision "
+                         "only -- it shares the trunk but never feeds move "
+                         "choice, since the outcome is a fact about the whole "
+                         "game and a move picked using it would be picked with "
+                         "hindsight. 0 disables it entirely.")
     ap.add_argument("--w-cpl", type=float, default=0.0,
                     help="weight on the CPL term. 0 disables it even with a "
                          "corpus attached, which is how the control arm runs.")
@@ -267,7 +275,8 @@ def main():
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.05,
                             betas=(0.9, 0.95))
     w = (1.0, args.w_time, args.w_elo)
-    lossk = dict(time_centres=torch.as_tensor(TIME_CENTRES), w_cpl=args.w_cpl)
+    lossk = dict(time_centres=torch.as_tensor(TIME_CENTRES), w_cpl=args.w_cpl,
+                 w_result=args.w_result)
 
     hist, curve = [], []
     step, t0, stop = 0, time.time(), False
@@ -303,10 +312,12 @@ def main():
                     drop = torch.rand(eb.shape, device=eb.device) < args.elo_drop
                     eb = torch.where(drop, torch.full_like(eb, N_ELO_BINS), eb)
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.amp):
-                ml, tl, el, _, _ = model(b["planes"], b["extra"], b["cands"], b["ply_idx"],
-                                         b["pad_mask"], b["my_turn"], b["game_slot"], pp,
-                                         elo_bin=eb)
-                loss, st = multitask_loss(ml, tl, el, b, *w, **lossk)
+                ml, tl, el, _, hh = model(b["planes"], b["extra"], b["cands"], b["ply_idx"],
+                                          b["pad_mask"], b["my_turn"], b["game_slot"], pp,
+                                          elo_bin=eb)
+                core_m = model.module if hasattr(model, "module") else model
+                rl = core_m.result_logits(hh) if args.w_result > 0 else None
+                loss, st = multitask_loss(ml, tl, el, b, *w, result_logits=rl, **lossk)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -341,9 +352,11 @@ def main():
 
             if step % 100 == 0:
                 dt = time.time() - t0
+                res = (f" | win_acc {st['result_acc']:.3f}"
+                       if "result_acc" in st else "")
                 print(f"step {step:>7} | total {st['total']:6.3f} | move {st['move']:6.3f} "
                       f"(acc {st['move_acc']:.3f}) | time_acc {st.get('time_acc', 0):.3f} "
-                      f"| elo_mae {st.get('elo_mae', float('nan')):5.0f} | "
+                      f"| elo_mae {st.get('elo_mae', float('nan')):5.0f}{res} | "
                       f"{step/dt:5.2f} it/s | {dt/60:6.1f} min", flush=True)
                 curve.append({"step": step, "minutes": round(dt / 60, 2), **st})
 

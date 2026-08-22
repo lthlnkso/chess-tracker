@@ -286,8 +286,15 @@ class MultiGameDataset(Dataset):
         my_turn = np.zeros(T, dtype=bool)
         my_turn[seat::2] = True
         elo = int(row["white_elo"] if seat == 0 else row["black_elo"])
+        # Outcome from THIS player's side, not White's: 0 loss, 1 draw, 2 win.
+        # meta stores +1 White, -1 Black, 0 draw, so Black's view is a sign flip.
+        r = int(row["result"])
+        if seat == 1:
+            r = -r
+        result = {-1: 0, 0: 1, 1: 2}[r]
         return (pos, pos_r, cnd, cnd_r, chosen, labels, nsel, T,
-                feats[:T], targets[:T], valid[:T], my_turn, elo, cnd_ev, cpl_ok)
+                feats[:T], targets[:T], valid[:T], my_turn, elo, cnd_ev, cpl_ok,
+                result)
 
     def __getitem__(self, i: int):
         rng = np.random.default_rng()
@@ -319,12 +326,13 @@ class MultiGameDataset(Dataset):
         pos_l, posr_l, cnd_l, cndr_l = [], [], [], []
         extra_l, ttgt_l, tval_l, mine_l, slot_l = [], [], [], [], []
         lab_l, ply_l, nsel_l, elos = [], [], [], []
+        res_l = []
         cev_l, cok_l = [], []
         offset = 0
         for slot, j in enumerate(pick):
             gi, seat, si = int(gidx[j]), int(seats[j]), int(shds[j])
             (pos, posr, cnd, cndr, chosen, labels, nsel, T,
-             fe, tt, tv, mt, elo, cev, cok) = self._one_game(si, gi, seat, rng)
+             fe, tt, tv, mt, elo, cev, cok, res) = self._one_game(si, gi, seat, rng)
             cev_l.append(cev.reshape(-1, self.n_cand)); cok_l.append(cok)
             pos_l.append(pos); posr_l.append(posr)
             cnd_l.append(cnd); cndr_l.append(cndr)
@@ -334,6 +342,10 @@ class MultiGameDataset(Dataset):
             lab_l.append(labels); nsel_l.append(nsel)
             ply_l.append(chosen + offset)
             elos.append(elo)
+            # one label per PLY: the head is a value function, predicting the
+            # eventual result from each position. The trunk is causal, so ply t
+            # genuinely cannot see the moves that decided the game.
+            res_l.append(np.full(T, res, dtype=np.int64))
             offset += T
 
         # One encode for the entire sample: every position of every game, plus
@@ -369,6 +381,7 @@ class MultiGameDataset(Dataset):
             "ply_idx": torch.from_numpy(np.concatenate(ply_l)),
             "player_id": int(self.gpid[i]),
             "elo": int(np.median(elos)),
+            "result": torch.from_numpy(np.concatenate(res_l)),
             "n_games": k,
         }
 
@@ -392,6 +405,7 @@ def collate_multigame(batch: list[dict]) -> dict:
     cmask = torch.zeros((B, S, C), dtype=torch.bool)
     ply = torch.zeros((B, S), dtype=torch.long)
     lab = torch.zeros((B, S), dtype=torch.long)
+    res = torch.zeros((B, T), dtype=torch.long)
     pmask = torch.zeros((B, S), dtype=torch.bool)
     cev = torch.full((B, S, C), float('nan'), dtype=torch.float32)
     cok = torch.zeros((B, S), dtype=torch.bool)
@@ -401,6 +415,7 @@ def collate_multigame(batch: list[dict]) -> dict:
         planes[i, :t] = b["planes"]; extra[i, :t] = b["extra"]
         pad[i, :t] = False; ttgt[i, :t] = b["time_target"]
         tval[i, :t] = b["time_valid"]; mine[i, :t] = b["my_turn"]
+        res[i, :t] = b["result"]
         slot[i, :t] = b["game_slot"]
         if s:
             cands[i, :s] = b["cands"]; cmask[i, :s] = b["cand_valid"]
@@ -412,4 +427,5 @@ def collate_multigame(batch: list[dict]) -> dict:
             "cand_eval": cev, "cpl_ok": cok,
             "player_id": torch.tensor([b["player_id"] for b in batch], dtype=torch.long),
             "elo": torch.tensor([b["elo"] for b in batch], dtype=torch.long),
+            "result": res,
             "n_games": torch.tensor([b["n_games"] for b in batch], dtype=torch.long)}

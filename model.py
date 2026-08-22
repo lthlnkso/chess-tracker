@@ -412,6 +412,19 @@ class MultiTaskModel(nn.Module):
             nn.Linear(c.d_model, c.d_model // 2), nn.GELU(),
             nn.Linear(c.d_model // 2, n_elo_bins),
         )
+        # Who ends up winning, judged from each position. Per-ply rather than
+        # per-game because the trunk attends causally (is_causal=True), so the
+        # state at ply t contains nothing from after ply t -- which makes this a
+        # real value function rather than a head reading the ending it was shown.
+        # Three classes from the tracked player's side: 0 loss, 1 draw, 2 win.
+        #
+        # Auxiliary only. It shares the trunk but is deliberately NOT wired into
+        # score_candidates: the result is a fact about the whole game, and a move
+        # chosen using it would be choosing with hindsight.
+        self.result_head = nn.Sequential(
+            nn.Linear(c.d_model, c.d_model // 2), nn.GELU(),
+            nn.Linear(c.d_model // 2, 3),
+        )
         # pooled hidden state + predicted Elo + pooled time summary
         self.embed_head = nn.Sequential(
             nn.Linear(c.d_model + n_elo_bins + n_extra, c.d_model), nn.GELU(),
@@ -537,6 +550,10 @@ class MultiTaskModel(nn.Module):
         elo_logits = self.elo_head(pooled)                    # (B, n_elo_bins)
         return move_logits, time_logits, elo_logits, pooled, h
 
+    def result_logits(self, h):
+        """(B, T, 3) -- eventual outcome predicted from each position."""
+        return self.result_head(h)
+
     def embed(self, planes, extra, pad_mask, my_turn=None, game_slot=None,
               ply_pos=None, elo_bin=None):
         """128-d player vector. Elo estimate and pooled clock stats feed in."""
@@ -641,7 +658,8 @@ def cpl_loss(move_logits, batch):
 
 
 def multitask_loss(move_logits, time_logits, elo_logits, batch, w_move=1.0,
-                   w_time=0.3, w_elo=0.3, time_centres=None, w_cpl=0.0):
+                   w_time=0.3, w_elo=0.3, time_centres=None, w_cpl=0.0,
+                   w_result=0.0, result_logits=None):
     """Weighted sum of the three objectives, each reported in its own units."""
     out = {}
     loss, _ = successor_loss(move_logits, batch["label"], batch["cand_mask"],
@@ -690,6 +708,19 @@ def multitask_loss(move_logits, time_logits, elo_logits, batch, w_move=1.0,
         total = total + w_elo * el
     else:
         out["elo"] = float("nan")
+
+    # Auxiliary: eventual outcome from each position. Off unless w_result > 0,
+    # so every existing recipe is bit-identical to before.
+    if w_result > 0.0 and result_logits is not None and "result" in batch:
+        rvalid = ~batch["pad_mask"]
+        if rvalid.any():
+            rl = F.cross_entropy(result_logits[rvalid].float(),
+                                 batch["result"][rvalid])
+            out["result"] = rl.item()
+            with torch.no_grad():
+                pred = result_logits[rvalid].argmax(-1)
+                out["result_acc"] = (pred == batch["result"][rvalid]).float().mean().item()
+            total = total + w_result * rl
 
     out["total"] = total.item()
     return total, out
