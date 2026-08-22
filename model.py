@@ -369,7 +369,8 @@ class MultiTaskModel(nn.Module):
     def __init__(self, c: Config = Config(), n_planes: int = 8,
                  n_extra: int = 2, d_embed: int = 128,
                  n_time_bins: int = 9, n_elo_bins: int = 20, n_game_slots: int = 1,
-                 elo_cond: bool = False, elo_steer: bool = False):
+                 elo_cond: bool = False, elo_steer: bool = False,
+                 result_head: bool = False):
         super().__init__()
         self.cfg = c
         self.n_planes = n_planes
@@ -421,10 +422,15 @@ class MultiTaskModel(nn.Module):
         # Auxiliary only. It shares the trunk but is deliberately NOT wired into
         # score_candidates: the result is a fact about the whole game, and a move
         # chosen using it would be choosing with hindsight.
+        # OPT-IN, like elo_cond and elo_steer. Creating it unconditionally
+        # broke every existing checkpoint: twelve call sites build this model
+        # and load_state_dict is strict, so four tensors that no older
+        # checkpoint contains turned into a hard failure everywhere -- including
+        # the production loader.
         self.result_head = nn.Sequential(
             nn.Linear(c.d_model, c.d_model // 2), nn.GELU(),
             nn.Linear(c.d_model // 2, 3),
-        )
+        ) if result_head else None
         # pooled hidden state + predicted Elo + pooled time summary
         self.embed_head = nn.Sequential(
             nn.Linear(c.d_model + n_elo_bins + n_extra, c.d_model), nn.GELU(),
@@ -552,7 +558,7 @@ class MultiTaskModel(nn.Module):
 
     def result_logits(self, h):
         """(B, T, 3) -- eventual outcome predicted from each position."""
-        return self.result_head(h)
+        return None if self.result_head is None else self.result_head(h)
 
     def embed(self, planes, extra, pad_mask, my_turn=None, game_slot=None,
               ply_pos=None, elo_bin=None):

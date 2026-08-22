@@ -260,7 +260,8 @@ def main():
                            n_elo_bins=N_ELO_BINS,
                            n_game_slots=args.max_games,
                            elo_cond=args.elo_cond,
-                           elo_steer=args.elo_steer).to(device)
+                           elo_steer=args.elo_steer,
+                           result_head=args.w_result > 0).to(device)
     print(f"model {sum(p.numel() for p in model.parameters())/1e6:.2f}M params "
           f"on {device}", flush=True)
 
@@ -390,6 +391,7 @@ def main():
                             "d_embed": args.d_embed, "n_time_bins": N_TIME_BINS,
                             "n_elo_bins": N_ELO_BINS, "n_game_slots": args.max_games,
                 "elo_cond": args.elo_cond, "elo_steer": args.elo_steer,
+                "result_head": args.w_result > 0,
                             "max_len_per_game": args.max_len_per_game,
                             "step": step, "val": ev},
                            os.path.join(args.out, "last.pt"))
@@ -405,6 +407,7 @@ def main():
                 "d_embed": args.d_embed, "n_time_bins": N_TIME_BINS,
                 "n_elo_bins": N_ELO_BINS, "n_game_slots": args.max_games,
                 "elo_cond": args.elo_cond, "elo_steer": args.elo_steer,
+                "result_head": args.w_result > 0,
                 "max_len_per_game": args.max_len_per_game,
                 "step": step, "val": ev},
                os.path.join(args.out, "last.pt"))

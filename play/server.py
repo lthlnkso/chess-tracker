@@ -62,13 +62,37 @@ def _dev(*ts):
     return out if len(out) > 1 else out[0]
 
 
+def _wants(ck, name):
+    """Is this optional head present in the checkpoint?
+
+    Prefer the saved flag, but fall back to looking for the weights. A
+    checkpoint written before a flag existed still carries that head's tensors,
+    and trusting the flag alone would build a model without it and then fail on
+    "unexpected keys" -- which is how ab_head.pt, trained hours before the flag
+    was added, became unloadable.
+    """
+    if ck.get(name):
+        return True
+    return any(k.startswith(name) or k == "steer_gate" and name == "elo_steer"
+               for k in ck.get("model", {}))
+
+
 def _build(ck):
     cfg = Config(**ck["cfg"])
     m = MultiTaskModel(cfg, n_planes=ck["n_planes"], n_extra=ck["n_extra"],
                        d_embed=ck["d_embed"], n_time_bins=N_TIME_BINS,
                        n_elo_bins=N_ELO_BINS,
                        n_game_slots=ck.get("n_game_slots", 1),
-                       elo_cond=bool(ck.get("elo_cond")))
+                       elo_cond=bool(ck.get("elo_cond")),
+                       # Without this the steering weights load as "unexpected"
+                       # and are silently dropped -- the bot would look like it
+                       # had the pathway and behave as if it did not.
+                       elo_steer=_wants(ck, "elo_steer"),
+                       result_head=_wants(ck, "result_head"))
+    # STRICT on purpose. Every optional head is declared by a flag saved in the
+    # checkpoint, so a mismatch here is a real one -- and a silently dropped
+    # weight does not crash, it just plays differently, which is the worst way
+    # for this to fail.
     m.load_state_dict(ck["model"])
     m.eval()
     m.to(DEVICE)
