@@ -440,13 +440,25 @@ class MultiTaskModel(nn.Module):
         #
         # Zero-init, matching elo_cond: a checkpoint that never trained this is
         # bit-identical to one built without it.
+        # Gated, and the gate is what starts at zero -- not the projection.
+        #
+        # ctx comes out of ln_f, so the candidate dot product assumes a
+        # layer-normalised scale (||ctx|| ~ 20 at d_model 384). Adding an
+        # unbounded Linear to it lets every move logit grow with the projection's
+        # weights until the cross-entropy overflows: measured NaN at step 11k,
+        # then again at 15k after the gradient fix. tanh bounds the direction and
+        # the scalar gate bounds its size.
+        #
+        # The PROJECTION keeps its normal init and only the GATE is zeroed. Zero
+        # the projection instead and the contribution is still zero, but so is
+        # the gradient reaching it, and it never learns anything.
         self.elo_steer = nn.Linear(n_elo_bins, c.d_model) if elo_steer else None
+        self.steer_gate = nn.Parameter(torch.zeros(1)) if elo_steer else None
 
         self.apply(ChessTransformer._init)
         if self.elo_cond is not None:
             nn.init.zeros_(self.elo_cond.weight)
-        if self.elo_steer is not None:
-            nn.init.zeros_(self.elo_steer.weight); nn.init.zeros_(self.elo_steer.bias)
+
 
     # -- trunk ------------------------------------------------------------
     def encode(self, planes, extra, game_slot=None, ply_pos=None, elo_bin=None):
@@ -509,7 +521,7 @@ class MultiTaskModel(nn.Module):
         if self.elo_steer is not None and elo_p is not None:
             # the prefix estimate AT each scored ply, not a game-level one
             ep = elo_p.gather(1, ply_idx[..., None].expand(-1, -1, elo_p.size(-1)))
-            ctx = ctx + self.elo_steer(ep.to(ctx.dtype))
+            ctx = ctx + self.steer_gate * torch.tanh(self.elo_steer(ep.to(ctx.dtype)))
         B, P, C = cands.shape[:3]
         e = self.ln_c(self.cand_enc(cands.reshape(B, P, C, -1).to(ctx.dtype)))
         return torch.einsum("bpd,bpcd->bpc", ctx, e) * self.scale
